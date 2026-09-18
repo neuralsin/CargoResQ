@@ -22,7 +22,7 @@ def card(master: Any, **kwargs: Any) -> ctk.CTkFrame:
         border_color=COLORS["line"],
     )
     options.update(kwargs)
-    return ctk.CTkFrame(master, **options)
+    return ctk.CTkFrame(master, **options)  # type: ignore[arg-type]
 
 
 def eyebrow(master: Any, text: str) -> ctk.CTkLabel:
@@ -79,7 +79,7 @@ def primary_button(master: Any, text: str, command: Callable, **kwargs: Any) -> 
         corner_radius=RADIUS_PILL,
     )
     options.update(kwargs)
-    return ctk.CTkButton(master, **options)
+    return ctk.CTkButton(master, **options)  # type: ignore[arg-type]
 
 
 def secondary_button(master: Any, text: str, command: Callable, **kwargs: Any) -> ctk.CTkButton:
@@ -96,7 +96,7 @@ def secondary_button(master: Any, text: str, command: Callable, **kwargs: Any) -
         corner_radius=RADIUS_PILL,
     )
     options.update(kwargs)
-    return ctk.CTkButton(master, **options)
+    return ctk.CTkButton(master, **options)  # type: ignore[arg-type]
 
 
 def danger_button(master: Any, text: str, command: Callable, **kwargs: Any) -> ctk.CTkButton:
@@ -111,7 +111,7 @@ def danger_button(master: Any, text: str, command: Callable, **kwargs: Any) -> c
         corner_radius=RADIUS_PILL,
     )
     options.update(kwargs)
-    return ctk.CTkButton(master, **options)
+    return ctk.CTkButton(master, **options)  # type: ignore[arg-type]
 
 
 class StatCard(ctk.CTkFrame):
@@ -126,7 +126,8 @@ class StatCard(ctk.CTkFrame):
             border_width=1,
             border_color=COLORS["line"],
         )
-        eyebrow(self, title).pack(anchor="w", padx=16, pady=(14, 2))
+        self.title_label = eyebrow(self, title)
+        self.title_label.pack(anchor="w", padx=16, pady=(14, 2))
         self.value_label = ctk.CTkLabel(
             self,
             text=value,
@@ -134,12 +135,19 @@ class StatCard(ctk.CTkFrame):
             font=ctk.CTkFont(size=26, weight="bold"),
         )
         self.value_label.pack(anchor="w", padx=16)
-        ctk.CTkLabel(
+        self.detail_label = ctk.CTkLabel(
             self,
             text=detail,
             text_color=COLORS["muted"],
             font=ctk.CTkFont(size=11),
-        ).pack(anchor="w", padx=16, pady=(0, 14))
+        )
+        self.detail_label.pack(anchor="w", padx=16, pady=(0, 14))
+
+    def update_card(self, title: str, value: str, detail: str, accent: Optional[str] = None) -> None:
+        """Update stat card labels in-place without destroying and recreating widgets."""
+        self.title_label.configure(text=title.upper())
+        self.value_label.configure(text=value, text_color=accent or COLORS["ink"])
+        self.detail_label.configure(text=detail)
 
 
 class ListRow(ctk.CTkFrame):
@@ -243,4 +251,4 @@ class KeyValueGrid(ctk.CTkFrame):
 def scrollable(master: Any, **kwargs: Any) -> ctk.CTkScrollableFrame:
     options = dict(fg_color="transparent")
     options.update(kwargs)
-    return ctk.CTkScrollableFrame(master, **options)
+    return ctk.CTkScrollableFrame(master, **options)  # type: ignore[arg-type]

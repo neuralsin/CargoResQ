@@ -61,6 +61,7 @@ class MapPanel(ctk.CTkFrame):
         self._on_marker_click = on_marker_click
         self._markers: Dict[str, Any] = {}
         self._paths: List[Any] = []
+        self._last_positions: Optional[Tuple[Tuple[float, float], ...]] = None
 
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)
@@ -138,6 +139,7 @@ class MapPanel(ctk.CTkFrame):
         if lat is None or lng is None:
             return
         fill, text_color = MARKER_COLORS.get(kind, MARKER_COLORS["own_truck"])
+        click_cb = self._on_marker_click
         try:
             marker = self.map_view.set_marker(
                 float(lat),
@@ -147,14 +149,14 @@ class MapPanel(ctk.CTkFrame):
                 marker_color_outside=fill,
                 text_color=COLORS["ink"],
                 command=(
-                    (lambda _m, k=key: self._on_marker_click(k))
-                    if self._on_marker_click
+                    (lambda _m, k=key: click_cb(k))
+                    if click_cb is not None
                     else None
                 ),
             )
         except Exception:
             return
-        marker.cargoresq_detail = detail
+        setattr(marker, "cargoresq_detail", detail)
         self._markers[key] = marker
 
     def add_path(self, points: Iterable[Tuple[float, float]], color: str = COLORS["teal"]) -> None:

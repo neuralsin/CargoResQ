@@ -11,6 +11,7 @@ Run with:
 """
 from __future__ import annotations
 
+import os
 import threading
 from tkinter import messagebox
 from typing import Any, Callable, Dict, List, Optional
@@ -47,10 +48,10 @@ try:  # package import when run with -m, flat import under PyInstaller
         secondary_button,
     )
 except ImportError:  # pragma: no cover - frozen build
-    from api_client import ApiError, CargoResQClient, DEFAULT_API_URL
-    from live_feed import LiveFeed
-    from map_panel import MapPanel
-    from theme import (
+    from api_client import ApiError, CargoResQClient, DEFAULT_API_URL  # pyright: ignore[reportMissingImports]
+    from live_feed import LiveFeed  # pyright: ignore[reportMissingImports]
+    from map_panel import MapPanel  # pyright: ignore[reportMissingImports]
+    from theme import (  # pyright: ignore[reportMissingImports]
         COLORS,
         SIDEBAR_WIDTH,
         minutes_label,
@@ -60,7 +61,7 @@ except ImportError:  # pragma: no cover - frozen build
         state_color,
         state_label,
     )
-    from widgets import (
+    from widgets import (  # pyright: ignore[reportMissingImports]
         EmptyState,
         KeyValueGrid,
         ListRow,
@@ -75,6 +76,12 @@ except ImportError:  # pragma: no cover - frozen build
         scrollable,
         secondary_button,
     )
+
+# ============================================================================
+# Code Settings
+# ============================================================================
+# Configure the backend API URL directly here (or override via CARGORESQ_API_URL):
+API_ENDPOINT = os.getenv("CARGORESQ_API_URL", "http://localhost:8000")
 
 REFRESH_INTERVAL_MS = 15_000
 EVENT_POLL_MS = 400
@@ -108,25 +115,31 @@ class LoginView(ctk.CTkFrame):
             font=ctk.CTkFont(size=11, weight="bold"),
         ).grid(row=1, column=0, padx=44, pady=(0, 26))
 
-        self.endpoint = self._field(panel, "API endpoint", 2, DEFAULT_API_URL)
-        self.email = self._field(panel, "Company email", 4, "")
-        self.password = self._field(panel, "Password", 6, "", show="•")
+        self.email = self._field(panel, "Company email", 2, "")
+        self.password = self._field(panel, "Password", 4, "", show="•")
 
         self.status = ctk.CTkLabel(
             panel, text="", text_color=COLORS["red"], wraplength=380,
             font=ctk.CTkFont(size=11),
         )
-        self.status.grid(row=8, column=0, padx=44, pady=(8, 0))
+        self.status.grid(row=6, column=0, padx=44, pady=(8, 0))
 
         self.button = primary_button(panel, "Sign in", self.submit, width=390, height=42)
-        self.button.grid(row=9, column=0, padx=44, pady=(18, 10))
+        self.button.grid(row=7, column=0, padx=44, pady=(18, 8))
+
+        ctk.CTkLabel(
+            panel,
+            text=f"Connecting to: {API_ENDPOINT}  (configured in desktop_app/app.py)",
+            text_color=COLORS["muted"],
+            font=ctk.CTkFont(size=10),
+        ).grid(row=8, column=0, padx=44, pady=(0, 4))
 
         ctk.CTkLabel(
             panel,
             text="Seed demo accounts with:  python scripts/seed_demo.py",
             text_color=COLORS["muted"],
             font=ctk.CTkFont(size=10),
-        ).grid(row=10, column=0, padx=44, pady=(0, 32))
+        ).grid(row=9, column=0, padx=44, pady=(0, 32))
 
         self.email.bind("<Return>", lambda _e: self.submit())
         self.password.bind("<Return>", lambda _e: self.submit())
@@ -157,7 +170,7 @@ class LoginView(ctk.CTkFrame):
 
         def work():
             try:
-                self.master_app.connect(self.endpoint.get().strip(), email, password)
+                self.master_app.connect(API_ENDPOINT, email, password)
                 self.after(0, self.master_app.show_dashboard)
             except ApiError as exc:
                 self.after(0, lambda: self.status.configure(text=str(exc)))
@@ -187,6 +200,9 @@ class DashboardView(ctk.CTkFrame):
         self.selected_offers: List[Dict[str, Any]] = []
 
         self.sidebar_buttons: Dict[str, ctk.CTkButton] = {}
+        self.tab_frames: Dict[str, ctk.CTkFrame] = {}
+        self.stat_cards: List[StatCard] = []
+        self.map_panel: Optional[MapPanel] = None
         self.feed: Optional[LiveFeed] = None
 
         self.grid_columnconfigure(1, weight=1)
@@ -275,11 +291,19 @@ class DashboardView(ctk.CTkFrame):
         self.stats.grid(row=1, column=0, sticky="ew", pady=(0, 14))
         for i in range(4):
             self.stats.grid_columnconfigure(i, weight=1)
+            sc = StatCard(self.stats, "", "0", "")
+            sc.grid(
+                row=0, column=i, sticky="ew",
+                padx=(0 if i == 0 else 6, 0 if i == 3 else 6),
+            )
+            self.stat_cards.append(sc)
 
         self.content = ctk.CTkFrame(self.main, fg_color="transparent")
         self.content.grid(row=2, column=0, sticky="nsew")
         self.content.grid_columnconfigure(0, weight=1)
         self.content.grid_rowconfigure(0, weight=1)
+
+        self.show_tab(self.active_tab)
 
     def switch_tab(self, name: str) -> None:
         self.active_tab = name
@@ -293,7 +317,7 @@ class DashboardView(ctk.CTkFrame):
                     COLORS["sidebar_text_active"] if active else COLORS["sidebar_text"]
                 ),
             )
-        self.render()
+        self.show_tab(name)
 
     # -- data ------------------------------------------------------------
     def refresh(self) -> None:
@@ -344,18 +368,15 @@ class DashboardView(ctk.CTkFrame):
         if errors:
             self.master_app.set_status(errors[0])
         self._render_stats()
-        self.render()
+        self._update_tab(self.active_tab)
 
     def _render_stats(self) -> None:
-        for child in self.stats.winfo_children():
-            child.destroy()
-
         terminal = {"ESCROW_RELEASED", "CANCELLED", "DISPUTED"}
         open_incidents = [i for i in self.incidents if i.get("state") not in terminal]
         critical = [a for a in self.alerts if a.get("severity") == "CRITICAL"]
         live_trucks = [t for t in self.fleet if t.get("positionIsLive")]
 
-        cards = [
+        cards_data = [
             (
                 "Open incidents",
                 str(len(open_incidents)),
@@ -381,30 +402,51 @@ class DashboardView(ctk.CTkFrame):
                 COLORS["red"] if self.own_sos else None,
             ),
         ]
-        for index, (title, value, detail, accent) in enumerate(cards):
-            StatCard(self.stats, title, value, detail, accent).grid(
-                row=0, column=index, sticky="ew",
-                padx=(0 if index == 0 else 6, 0 if index == 3 else 6),
-            )
+        for index, (title, value, detail, accent) in enumerate(cards_data):
+            if index < len(self.stat_cards):
+                self.stat_cards[index].update_card(title, value, detail, accent)
 
-    # -- rendering -------------------------------------------------------
+    # -- tab management --------------------------------------------------
+    def show_tab(self, name: str) -> None:
+        for tab_name, frame in self.tab_frames.items():
+            if tab_name != name:
+                frame.grid_remove()
+
+        if name not in self.tab_frames:
+            builders: Dict[str, Callable[[], None]] = {
+                "Command centre": self._build_command_centre,
+                "Rescue offers": self._build_offers,
+                "Fleet": self._build_fleet,
+                "Telemetry": self._build_telemetry,
+                "SOS": self._build_sos,
+                "Shipments": self._build_shipments,
+            }
+            builder = builders.get(name, self._build_command_centre)
+            builder()
+
+        self.tab_frames[name].grid(row=0, column=0, sticky="nsew")
+        self._update_tab(name)
+
+    def _update_tab(self, name: str) -> None:
+        if name not in self.tab_frames:
+            return
+        updaters: Dict[str, Callable[[], None]] = {
+            "Command centre": self._update_command_centre,
+            "Rescue offers": self._update_offers,
+            "Fleet": self._update_fleet,
+            "Telemetry": self._update_telemetry,
+            "SOS": self._update_sos,
+            "Shipments": self._update_shipments,
+        }
+        updater = updaters.get(name, self._update_command_centre)
+        updater()
+
     def render(self) -> None:
-        for child in self.content.winfo_children():
-            child.destroy()
-        renderer: Callable[[], None] = {
-            "Command centre": self._render_command_centre,
-            "Rescue offers": self._render_offers,
-            "Fleet": self._render_fleet,
-            "Telemetry": self._render_telemetry,
-            "SOS": self._render_sos,
-            "Shipments": self._render_shipments,
-        }.get(self.active_tab, self._render_command_centre)
-        renderer()
+        self._update_tab(self.active_tab)
 
     # ---- command centre ----
-    def _render_command_centre(self) -> None:
+    def _build_command_centre(self) -> None:
         wrap = ctk.CTkFrame(self.content, fg_color="transparent")
-        wrap.grid(row=0, column=0, sticky="nsew")
         wrap.grid_columnconfigure(0, weight=2, uniform="cc")
         wrap.grid_columnconfigure(1, weight=3, uniform="cc")
         wrap.grid_rowconfigure(0, weight=1)
@@ -422,12 +464,30 @@ class DashboardView(ctk.CTkFrame):
             header, "Report breakdown", self._open_report_breakdown, width=140
         ).grid(row=0, column=1, sticky="e")
 
-        listing = scrollable(left)
-        listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(4, 14))
+        self.cc_incidents_listing = scrollable(left)
+        self.cc_incidents_listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(4, 14))
+
+        right = ctk.CTkFrame(wrap, fg_color="transparent")
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(0, weight=3)
+        right.grid_rowconfigure(1, weight=2)
+
+        self.cc_map_panel = MapPanel(right, height=320)
+        self.cc_map_panel.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
+
+        self.detail_card = card(right)
+        self.detail_card.grid(row=1, column=0, sticky="nsew")
+
+        self.tab_frames["Command centre"] = wrap
+
+    def _update_command_centre(self) -> None:
+        for child in self.cc_incidents_listing.winfo_children():
+            child.destroy()
 
         if not self.incidents:
             EmptyState(
-                listing,
+                self.cc_incidents_listing,
                 "No incidents",
                 "Nothing has broken down. Incidents appear here the moment a "
                 "driver reports a breakdown from the app.",
@@ -436,7 +496,7 @@ class DashboardView(ctk.CTkFrame):
             for incident in self.incidents:
                 state = incident.get("state", "")
                 ListRow(
-                    listing,
+                    self.cc_incidents_listing,
                     incident.get("cargoType") or "Cargo rescue",
                     f"{incident.get('id')}  |  {state_label(state)}"
                     + (
@@ -450,24 +510,14 @@ class DashboardView(ctk.CTkFrame):
                     selected=incident["id"] == self.selected_incident_id,
                 ).pack(fill="x", pady=4, padx=2)
 
-        right = ctk.CTkFrame(wrap, fg_color="transparent")
-        right.grid(row=0, column=1, sticky="nsew")
-        right.grid_columnconfigure(0, weight=1)
-        right.grid_rowconfigure(0, weight=3)
-        right.grid_rowconfigure(1, weight=2)
-
-        self.map_panel = MapPanel(right, height=320)
-        self.map_panel.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
-        self._draw_map()
-
-        self.detail_card = card(right)
-        self.detail_card.grid(row=1, column=0, sticky="nsew")
+        self.map_panel = self.cc_map_panel
+        self._draw_map(self.cc_map_panel)
         self._render_incident_detail()
 
-    def _draw_map(self) -> None:
-        if not hasattr(self, "map_panel"):
+    def _draw_map(self, target_panel: Optional[MapPanel] = None) -> None:
+        panel = target_panel or getattr(self, "map_panel", None)
+        if panel is None:
             return
-        panel = self.map_panel
         panel.clear()
         positions = []
 
@@ -512,7 +562,11 @@ class DashboardView(ctk.CTkFrame):
             )
             positions.append((alat, alng))
 
-        panel.fit_to_markers(positions)
+        pos_tuple = tuple(sorted(positions))
+        if getattr(panel, "_last_positions", None) != pos_tuple:
+            panel.fit_to_markers(positions)
+            panel._last_positions = pos_tuple
+
         stale = len([t for t in self.fleet if not t.get("positionIsLive")])
         panel.set_status(
             f"{len(positions)} positions  |  {stale} truck(s) not reporting"
@@ -521,6 +575,8 @@ class DashboardView(ctk.CTkFrame):
         )
 
     def _render_incident_detail(self) -> None:
+        if not hasattr(self, "detail_card"):
+            return
         for child in self.detail_card.winfo_children():
             child.destroy()
 
@@ -659,9 +715,8 @@ class DashboardView(ctk.CTkFrame):
             ).pack(side="right")
 
     # ---- offers tab ----
-    def _render_offers(self) -> None:
+    def _build_offers(self) -> None:
         wrap = ctk.CTkFrame(self.content, fg_color="transparent")
-        wrap.grid(row=0, column=0, sticky="nsew")
         wrap.grid_columnconfigure(0, weight=1, uniform="o")
         wrap.grid_columnconfigure(1, weight=1, uniform="o")
         wrap.grid_rowconfigure(0, weight=1)
@@ -678,19 +733,35 @@ class DashboardView(ctk.CTkFrame):
             size=11,
         ).grid(row=0, column=0, sticky="w", padx=18, pady=(34, 0))
 
-        listing = scrollable(inbox)
-        listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(12, 14))
+        self.offers_inbox_listing = scrollable(inbox)
+        self.offers_inbox_listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(12, 14))
+
+        history = card(wrap)
+        history.grid(row=0, column=1, sticky="nsew")
+        history.grid_rowconfigure(1, weight=1)
+        history.grid_columnconfigure(0, weight=1)
+        heading(history, "Recent activity").grid(
+            row=0, column=0, sticky="w", padx=18, pady=(16, 8)
+        )
+        self.offers_history_listing = scrollable(history)
+        self.offers_history_listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+
+        self.tab_frames["Rescue offers"] = wrap
+
+    def _update_offers(self) -> None:
+        for child in self.offers_inbox_listing.winfo_children():
+            child.destroy()
 
         live = [o for o in self.inbox if o.get("state") in {"PENDING", "OWNER_CONFIRMED"}]
         if not live:
             EmptyState(
-                listing,
+                self.offers_inbox_listing,
                 "No open requests",
                 "When a nearby carrier's truck breaks down and one of ours fits "
                 "the cargo, the request appears here.",
             ).pack(fill="x")
         for offer in live:
-            holder = card(listing, fg_color=COLORS["row"])
+            holder = card(self.offers_inbox_listing, fg_color=COLORS["row"])
             holder.pack(fill="x", pady=5)
             row = ctk.CTkFrame(holder, fg_color="transparent")
             row.pack(fill="x", padx=14, pady=(12, 2))
@@ -713,22 +784,15 @@ class DashboardView(ctk.CTkFrame):
                 buttons, "Decline", lambda o=offer: self._decline_offer(o), width=90
             ).pack(side="left")
 
-        history = card(wrap)
-        history.grid(row=0, column=1, sticky="nsew")
-        history.grid_rowconfigure(1, weight=1)
-        history.grid_columnconfigure(0, weight=1)
-        heading(history, "Recent activity").grid(
-            row=0, column=0, sticky="w", padx=18, pady=(16, 8)
-        )
-        past = scrollable(history)
-        past.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        for child in self.offers_history_listing.winfo_children():
+            child.destroy()
 
         closed = [o for o in self.inbox if o.get("state") not in {"PENDING", "OWNER_CONFIRMED"}]
         if not closed:
-            EmptyState(past, "Nothing yet").pack(fill="x")
+            EmptyState(self.offers_history_listing, "Nothing yet").pack(fill="x")
         for offer in closed[:25]:
             ListRow(
-                past,
+                self.offers_history_listing,
                 money(offer.get("payoutInr")),
                 f"{offer.get('id')}  |  {relative_time(offer.get('createdAt'))}",
                 state_label(offer.get("state", "")),
@@ -736,9 +800,8 @@ class DashboardView(ctk.CTkFrame):
             ).pack(fill="x", pady=4, padx=2)
 
     # ---- fleet ----
-    def _render_fleet(self) -> None:
+    def _build_fleet(self) -> None:
         wrap = ctk.CTkFrame(self.content, fg_color="transparent")
-        wrap.grid(row=0, column=0, sticky="nsew")
         wrap.grid_columnconfigure(0, weight=2, uniform="f")
         wrap.grid_columnconfigure(1, weight=3, uniform="f")
         wrap.grid_rowconfigure(0, weight=1)
@@ -756,12 +819,22 @@ class DashboardView(ctk.CTkFrame):
             row=0, column=1, sticky="e"
         )
 
-        listing = scrollable(listing_card)
-        listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(4, 14))
+        self.fleet_listing = scrollable(listing_card)
+        self.fleet_listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(4, 14))
+
+        self.fleet_map_panel = MapPanel(wrap, height=420)
+        self.fleet_map_panel.grid(row=0, column=1, sticky="nsew")
+        self.fleet_map_panel.set_title("Fleet positions", "OpenStreetMap")
+
+        self.tab_frames["Fleet"] = wrap
+
+    def _update_fleet(self) -> None:
+        for child in self.fleet_listing.winfo_children():
+            child.destroy()
 
         if not self.fleet:
             EmptyState(
-                listing, "No trucks registered", "Add a truck to start tracking it."
+                self.fleet_listing, "No trucks registered", "Add a truck to start tracking it."
             ).pack(fill="x")
         for truck in self.fleet:
             live = truck.get("positionIsLive")
@@ -774,7 +847,7 @@ class DashboardView(ctk.CTkFrame):
                 )
             )
             ListRow(
-                listing,
+                self.fleet_listing,
                 truck.get("registrationNumber", truck["truckId"]),
                 subtitle,
                 truck.get("status", "").replace("_", " "),
@@ -782,19 +855,17 @@ class DashboardView(ctk.CTkFrame):
                 on_click=lambda t=truck: self._focus_truck(t),
             ).pack(fill="x", pady=4, padx=2)
 
-        self.map_panel = MapPanel(wrap, height=420)
-        self.map_panel.grid(row=0, column=1, sticky="nsew")
-        self.map_panel.set_title("Fleet positions", "OpenStreetMap")
-        self._draw_map()
+        self.map_panel = self.fleet_map_panel
+        self._draw_map(self.fleet_map_panel)
 
     def _focus_truck(self, truck: Dict[str, Any]) -> None:
-        if hasattr(self, "map_panel") and truck.get("latitude") is not None:
-            self.map_panel.focus_on(truck["latitude"], truck["longitude"], zoom=13)
+        panel = getattr(self, "fleet_map_panel", None) or getattr(self, "map_panel", None)
+        if panel is not None and truck.get("latitude") is not None:
+            panel.focus_on(truck["latitude"], truck["longitude"], zoom=13)
 
     # ---- telemetry ----
-    def _render_telemetry(self) -> None:
+    def _build_telemetry(self) -> None:
         holder = card(self.content)
-        holder.grid(row=0, column=0, sticky="nsew")
         holder.grid_rowconfigure(1, weight=1)
         holder.grid_columnconfigure(0, weight=1)
 
@@ -806,19 +877,25 @@ class DashboardView(ctk.CTkFrame):
             size=11,
         ).grid(row=0, column=0, sticky="w", padx=18, pady=(34, 0))
 
-        listing = scrollable(holder)
-        listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(14, 14))
+        self.telemetry_listing = scrollable(holder)
+        self.telemetry_listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(14, 14))
+
+        self.tab_frames["Telemetry"] = holder
+
+    def _update_telemetry(self) -> None:
+        for child in self.telemetry_listing.winfo_children():
+            child.destroy()
 
         if not self.alerts:
             EmptyState(
-                listing,
+                self.telemetry_listing,
                 "Nothing to report",
                 "Alerts appear here when the fleet's telemetry says something "
                 "is wrong.",
             ).pack(fill="x")
 
         for alert in self.alerts:
-            entry = card(listing, fg_color=COLORS["row"])
+            entry = card(self.telemetry_listing, fg_color=COLORS["row"])
             entry.pack(fill="x", pady=5)
 
             row = ctk.CTkFrame(entry, fg_color="transparent")
@@ -851,9 +928,8 @@ class DashboardView(ctk.CTkFrame):
             ).pack(side="left")
 
     # ---- sos ----
-    def _render_sos(self) -> None:
+    def _build_sos(self) -> None:
         wrap = ctk.CTkFrame(self.content, fg_color="transparent")
-        wrap.grid(row=0, column=0, sticky="nsew")
         wrap.grid_columnconfigure(0, weight=1, uniform="s")
         wrap.grid_columnconfigure(1, weight=1, uniform="s")
         wrap.grid_rowconfigure(0, weight=1)
@@ -864,12 +940,8 @@ class DashboardView(ctk.CTkFrame):
         own.grid_columnconfigure(0, weight=1)
         heading(own, "Our drivers").grid(row=0, column=0, sticky="w", padx=18, pady=(16, 8))
 
-        own_list = scrollable(own)
-        own_list.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
-        if not self.own_sos:
-            EmptyState(own_list, "No active emergencies", "Everyone is safe.").pack(fill="x")
-        for alert in self.own_sos:
-            self._render_sos_card(own_list, alert, own=True)
+        self.sos_own_listing = scrollable(own)
+        self.sos_own_listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
 
         nearby = card(wrap)
         nearby.grid(row=0, column=1, sticky="nsew")
@@ -885,12 +957,25 @@ class DashboardView(ctk.CTkFrame):
             size=11,
         ).grid(row=0, column=0, sticky="w", padx=18, pady=(34, 0))
 
-        nearby_list = scrollable(nearby)
-        nearby_list.grid(row=1, column=0, sticky="nsew", padx=14, pady=(14, 14))
+        self.sos_nearby_listing = scrollable(nearby)
+        self.sos_nearby_listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(14, 14))
+
+        self.tab_frames["SOS"] = wrap
+
+    def _update_sos(self) -> None:
+        for child in self.sos_own_listing.winfo_children():
+            child.destroy()
+        if not self.own_sos:
+            EmptyState(self.sos_own_listing, "No active emergencies", "Everyone is safe.").pack(fill="x")
+        for alert in self.own_sos:
+            self._render_sos_card(self.sos_own_listing, alert, own=True)
+
+        for child in self.sos_nearby_listing.winfo_children():
+            child.destroy()
         if not self.nearby_sos:
-            EmptyState(nearby_list, "Nothing nearby").pack(fill="x")
+            EmptyState(self.sos_nearby_listing, "Nothing nearby").pack(fill="x")
         for alert in self.nearby_sos:
-            self._render_sos_card(nearby_list, alert, own=False)
+            self._render_sos_card(self.sos_nearby_listing, alert, own=False)
 
     def _render_sos_card(self, master: Any, alert: Dict[str, Any], own: bool) -> None:
         entry = card(master, fg_color=COLORS["red_soft"] if own else COLORS["row"])
@@ -963,9 +1048,8 @@ class DashboardView(ctk.CTkFrame):
             ).pack(side="left")
 
     # ---- shipments ----
-    def _render_shipments(self) -> None:
+    def _build_shipments(self) -> None:
         holder = card(self.content)
-        holder.grid(row=0, column=0, sticky="nsew")
         holder.grid_rowconfigure(1, weight=1)
         holder.grid_columnconfigure(0, weight=1)
 
@@ -977,10 +1061,16 @@ class DashboardView(ctk.CTkFrame):
             row=0, column=1, sticky="e"
         )
 
-        listing = scrollable(holder)
-        listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        self.shipments_listing = scrollable(holder)
+        self.shipments_listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+
+        self.tab_frames["Shipments"] = holder
+
+    def _update_shipments(self) -> None:
+        for child in self.shipments_listing.winfo_children():
+            child.destroy()
         if not self.shipments:
-            EmptyState(listing, "No shipments", "Add a shipment to track it.").pack(fill="x")
+            EmptyState(self.shipments_listing, "No shipments", "Add a shipment to track it.").pack(fill="x")
         for shipment in self.shipments:
             conditions = []
             if shipment.get("requires_refrigeration"):
@@ -988,7 +1078,7 @@ class DashboardView(ctk.CTkFrame):
             if shipment.get("is_hazmat"):
                 conditions.append("hazmat")
             ListRow(
-                listing,
+                self.shipments_listing,
                 shipment.get("cargo_type", "Cargo"),
                 f"{money(shipment.get('value_inr'))}  |  "
                 f"{shipment.get('weight_kg')} kg  |  "
@@ -1008,10 +1098,10 @@ class DashboardView(ctk.CTkFrame):
                 offers = self.master_app.client.incident_offers(incident_id)
             except ApiError:
                 offers = []
-            self.after(0, lambda: self._set_offers(offers))
+            self._safe_after(lambda: self._set_offers(offers))
 
         threading.Thread(target=work, daemon=True).start()
-        self.render()
+        self._update_tab("Command centre")
 
     def _set_offers(self, offers: List[Dict[str, Any]]) -> None:
         self.selected_offers = offers
@@ -1235,7 +1325,7 @@ class CargoResQApp(ctk.CTk):
         self.minsize(1180, 740)
         self.configure(fg_color=COLORS["canvas"])
 
-        self.client = CargoResQClient()
+        self.client = CargoResQClient(API_ENDPOINT)
         self.dashboard: Optional[DashboardView] = None
 
         self.grid_rowconfigure(0, weight=1)
@@ -1272,7 +1362,7 @@ class CargoResQApp(ctk.CTk):
         self.set_status(f"Signed in as {self.client.company_name}")
 
     def connect(self, endpoint: str, email: str, password: str) -> None:
-        self.client = CargoResQClient(endpoint or DEFAULT_API_URL)
+        self.client = CargoResQClient(endpoint or API_ENDPOINT)
         self.client.login(email, password)
 
     def sign_out(self) -> None:
