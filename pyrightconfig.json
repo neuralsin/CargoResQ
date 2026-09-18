@@ -1,0 +1,21 @@
+{
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Windows",
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "pythonPath": "C:\\Users\\shaan\\AppData\\Local\\Programs\\Python\\Python311\\python.exe",
+      "extraPaths": [
+        "C:\\Users\\shaan\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\site-packages",
+        ".",
+        "desktop_app",
+        "services/core_api",
+        "services/matching_engine",
+        "services/pricing_engine",
+        "services/escrow_ledger",
+        "services/realtime_gateway",
+        "services/orchestrator"
+      ]
+    }
+  ]
+}

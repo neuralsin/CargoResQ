@@ -1,0 +1,18 @@
+{
+  "python.defaultInterpreterPath": "C:\\Users\\shaan\\AppData\\Local\\Programs\\Python\\Python311\\python.exe",
+  "python.analysis.extraPaths": [
+    "C:\\Users\\shaan\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\site-packages",
+    "${workspaceFolder}",
+    "${workspaceFolder}/desktop_app",
+    "${workspaceFolder}/services/core_api",
+    "${workspaceFolder}/services/matching_engine",
+    "${workspaceFolder}/services/pricing_engine",
+    "${workspaceFolder}/services/escrow_ledger",
+    "${workspaceFolder}/services/realtime_gateway",
+    "${workspaceFolder}/services/orchestrator"
+  ],
+  "python.autoComplete.extraPaths": [
+    "C:\\Users\\shaan\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\site-packages",
+    "${workspaceFolder}"
+  ]
+}
