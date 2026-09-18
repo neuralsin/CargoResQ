@@ -14,3 +14,11 @@ node_modules/
 .gradle/
 **/build/
 *.apk
+
+# Local build artefacts and machine-specific config
+android_app/local.properties
+keystore.properties
+*.jks
+*.keystore
+.venv/
+venv/

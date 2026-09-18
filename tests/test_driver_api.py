@@ -16,7 +16,6 @@ async def test_driver_registration_and_workflow():
                 "name": f"Apex Pharma {uid}",
                 "email": f"ops_{uid}@apexpharma.com",
                 "password": "Password123!",
-                "role": "CARRIER_OWNER",
             },
         )
         assert comp_res.status_code == 201
@@ -63,8 +62,8 @@ async def test_driver_registration_and_workflow():
         driver_pass = "DriverPass123!"
         drv_reg = await ac.post(
             "/api/v1/driver/register",
+            headers=comp_headers,
             json={
-                "company_id": comp_id,
                 "name": f"Rajesh Kumar {uid}",
                 "email": driver_email,
                 "password": driver_pass,

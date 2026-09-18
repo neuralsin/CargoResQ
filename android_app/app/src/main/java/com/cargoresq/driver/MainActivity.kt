@@ -1,432 +1,1170 @@
 package com.cargoresq.driver
 
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Color
+import android.location.Location
+import android.location.LocationManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.view.LayoutInflater
 import android.view.View
+import android.view.ViewGroup
 import android.widget.*
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import com.cargoresq.driver.api.CargoResQApi
-import com.cargoresq.driver.model.DriverSession
-import com.google.android.material.bottomsheet.BottomSheetDialog
-import java.util.concurrent.Executors
+import com.cargoresq.driver.model.*
+import com.cargoresq.driver.telemetry.TelemetryService
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import org.osmdroid.config.Configuration
+import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.util.GeoPoint
+import org.osmdroid.views.MapView
+import org.osmdroid.views.overlay.Marker
+import java.text.SimpleDateFormat
+import java.util.*
 
+/**
+ * The driver app.
+ *
+ * Five screens on one activity: where you are, what jobs are on offer, the
+ * emergency button, safety guidance, and your account.
+ *
+ * What changed from the previous version is less the layout than the honesty.
+ * Every screen showed hardcoded values -- a fixed shipment, a fixed
+ * temperature, a fixed earnings figure -- and the API client turned every
+ * error into a successful-looking fake session. Nothing here invents data: if
+ * the server cannot be reached, the screen says so.
+ */
 class MainActivity : AppCompatActivity() {
 
-    private val executor = Executors.newSingleThreadExecutor()
-    private val mainHandler = Handler(Looper.getMainLooper())
-
-    private var currentSession: DriverSession? = null
-    private var currentTab: Int = 0 // 0: Home, 1: Services, 2: Activity, 3: Account
-
     private lateinit var contentFrame: FrameLayout
-    private lateinit var floatingNavBar: LinearLayout
+    private lateinit var navBar: LinearLayout
 
-    // Nav tabs
-    private lateinit var tabHome: LinearLayout
-    private lateinit var tabServices: LinearLayout
-    private lateinit var tabActivity: LinearLayout
-    private lateinit var tabAccount: LinearLayout
+    private var currentTab = TAB_HOME
+    private var profile: DriverProfile? = null
+    private var shipment: ShipmentInfo? = null
+    private var incident: IncidentInfo? = null
+    private var offers: List<OfferInfo> = emptyList()
+    private var emergencyNumbers: List<EmergencyNumber> = emptyList()
 
-    private lateinit var iconHome: ImageView
-    private lateinit var iconServices: ImageView
-    private lateinit var iconActivity: ImageView
-    private lateinit var iconAccount: ImageView
+    private var onDuty = false
+    private var lastKnownLocation: Location? = null
 
-    private lateinit var textHome: TextView
-    private lateinit var textServices: TextView
-    private lateinit var textActivity: TextView
-    private lateinit var textAccount: TextView
+    private var homeMap: MapView? = null
+    private var driverMarker: Marker? = null
+    private var tickerJob: Job? = null
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
-
-        contentFrame = findViewById(R.id.content_frame)
-        floatingNavBar = findViewById(R.id.floating_nav_bar)
-
-        tabHome = findViewById(R.id.tab_home)
-        tabServices = findViewById(R.id.tab_services)
-        tabActivity = findViewById(R.id.tab_activity)
-        tabAccount = findViewById(R.id.tab_account)
-
-        iconHome = findViewById(R.id.icon_home)
-        iconServices = findViewById(R.id.icon_services)
-        iconActivity = findViewById(R.id.icon_activity)
-        iconAccount = findViewById(R.id.icon_account)
-
-        textHome = findViewById(R.id.text_home)
-        textServices = findViewById(R.id.text_services)
-        textActivity = findViewById(R.id.text_activity)
-        textAccount = findViewById(R.id.text_account)
-
-        setupNavigation()
-
-        // Start with Auth screen if not logged in
-        showAuthScreen()
+    private val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
+        timeZone = TimeZone.getTimeZone("UTC")
     }
 
-    private fun setupNavigation() {
-        tabHome.setOnClickListener { switchTab(0) }
-        tabServices.setOnClickListener { switchTab(1) }
-        tabActivity.setOnClickListener { switchTab(2) }
-        tabAccount.setOnClickListener { switchTab(3) }
+    companion object {
+        private const val TAB_HOME = 0
+        private const val TAB_JOBS = 1
+        private const val TAB_SOS = 2
+        private const val TAB_SAFETY = 3
+        private const val TAB_ACCOUNT = 4
     }
 
-    private fun switchTab(tabIndex: Int) {
-        currentTab = tabIndex
-        updateNavPillStyles()
-
-        contentFrame.removeAllViews()
-        val inflater = LayoutInflater.from(this)
-
-        when (tabIndex) {
-            0 -> renderHomeScreen(inflater)
-            1 -> renderServicesScreen(inflater)
-            2 -> renderActivityScreen(inflater)
-            3 -> renderAccountScreen(inflater)
-        }
-    }
-
-    private fun updateNavPillStyles() {
-        val activeColor = ContextCompat.getColor(this, R.color.uber_white)
-        val mutedColor = ContextCompat.getColor(this, R.color.uber_gray_muted)
-
-        iconHome.setColorFilter(if (currentTab == 0) activeColor else mutedColor)
-        textHome.setTextColor(if (currentTab == 0) activeColor else mutedColor)
-
-        iconServices.setColorFilter(if (currentTab == 1) activeColor else mutedColor)
-        textServices.setTextColor(if (currentTab == 1) activeColor else mutedColor)
-
-        iconActivity.setColorFilter(if (currentTab == 2) activeColor else mutedColor)
-        textActivity.setTextColor(if (currentTab == 2) activeColor else mutedColor)
-
-        iconAccount.setColorFilter(if (currentTab == 3) activeColor else mutedColor)
-        textAccount.setTextColor(if (currentTab == 3) activeColor else mutedColor)
-    }
-
-    // ==========================================
-    // AUTH SCREEN
-    // ==========================================
-    private fun showAuthScreen() {
-        floatingNavBar.visibility = View.GONE
-        contentFrame.removeAllViews()
-
-        val view = LayoutInflater.from(this).inflate(R.layout.view_auth, contentFrame, false)
-
-        val inputEndpoint = view.findViewById<EditText>(R.id.input_endpoint)
-        val inputEmail = view.findViewById<EditText>(R.id.input_email)
-        val inputPassword = view.findViewById<EditText>(R.id.input_password)
-        val btnContinue = view.findViewById<LinearLayout>(R.id.btn_continue)
-        val txtContinue = view.findViewById<TextView>(R.id.txt_continue)
-        val btnDemoLogin = view.findViewById<LinearLayout>(R.id.btn_demo_login)
-
-        inputEndpoint.setText(CargoResQApi.baseUrl)
-
-        val doLogin = { email: String, pass: String ->
-            CargoResQApi.baseUrl = inputEndpoint.text.toString().trim()
-            txtContinue.text = "Signing in…"
-            btnContinue.isEnabled = false
-
-            executor.execute {
-                val result = CargoResQApi.login(email.trim(), pass)
-                mainHandler.post {
-                    btnContinue.isEnabled = true
-                    txtContinue.text = "Sign in securely"
-                    result.onSuccess { session ->
-                        currentSession = session
-                        floatingNavBar.visibility = View.VISIBLE
-                        switchTab(0)
-                    }.onFailure { err ->
-                        Toast.makeText(this, err.message ?: "Authentication failed", Toast.LENGTH_SHORT).show()
-                    }
-                }
-            }
-        }
-
-        btnContinue.setOnClickListener {
-            val email = inputEmail.text.toString()
-            val pass = inputPassword.text.toString()
-            if (email.isNotEmpty() && pass.isNotEmpty()) {
-                doLogin(email, pass)
-            } else {
-                Toast.makeText(this, "Enter driver email and password", Toast.LENGTH_SHORT).show()
-            }
-        }
-
-        btnDemoLogin.setOnClickListener {
-            inputEmail.setText("rajesh@apexpharma.com")
-            inputPassword.setText("Password123!")
-            doLogin("rajesh@apexpharma.com", "Password123!")
-        }
-
-        contentFrame.addView(view)
-    }
-
-    // ==========================================
-    // 1. HOME SCREEN (1:1 UBER DISPATCH & MAP)
-    // ==========================================
-    private fun renderHomeScreen(inflater: LayoutInflater) {
-        val view = inflater.inflate(R.layout.view_home, contentFrame, false)
-
-        val txtGreeting = view.findViewById<TextView>(R.id.txt_driver_greeting)
-        val txtCarrier = view.findViewById<TextView>(R.id.txt_carrier_sub)
-        val badgeStatus = view.findViewById<TextView>(R.id.badge_status)
-        val txtReefer = view.findViewById<TextView>(R.id.txt_current_reefer)
-
-        val btnSos = view.findViewById<LinearLayout>(R.id.btn_action_sos)
-        val btnReefer = view.findViewById<LinearLayout>(R.id.btn_action_reefer)
-        val btnPallet = view.findViewById<LinearLayout>(R.id.btn_action_pallet)
-        val btnHubs = view.findViewById<LinearLayout>(R.id.btn_action_hubs)
-        val btnTriggerBreakdown = view.findViewById<LinearLayout>(R.id.btn_trigger_breakdown)
-
-        currentSession?.let {
-            txtGreeting.text = it.driverName
-            txtCarrier.text = "Apex Cold Logistics • 4.96 ★"
-        }
-
-        val triggerSosAction = {
+    private val locationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { granted ->
+        val allowed = granted[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+            granted[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+        if (allowed) {
+            startDuty()
+        } else {
+            // Explain rather than silently do nothing. Without location the
+            // core promise of the product cannot be kept.
             AlertDialog.Builder(this)
-                .setTitle("🚨 Report Breakdown SOS?")
-                .setMessage("CargoResQ will broadcast your emergency GPS position (NH-48 Km 84.2) to dispatch and lock nearest rescue reefer.")
-                .setPositiveButton("Report Emergency") { _, _ ->
-                    badgeStatus.text = "BREAKDOWN REPORTED"
-                    badgeStatus.setBackgroundResource(R.drawable.bg_pill_danger)
-                    badgeStatus.setTextColor(ContextCompat.getColor(this, R.color.uber_white))
-                    txtReefer.setTextColor(ContextCompat.getColor(this, R.color.uber_red))
-
-                    executor.execute {
-                        currentSession?.let { s ->
-                            CargoResQApi.reportBreakdown(s.token, 18.7511, 73.3422)
-                        }
-                    }
-
-                    Toast.makeText(this, "SOS Sent. Rescue unit TRK-9042 dispatched.", Toast.LENGTH_LONG).show()
-                }
-                .setNegativeButton("Cancel", null)
-                .show()
-        }
-
-        btnSos.setOnClickListener { triggerSosAction() }
-        btnTriggerBreakdown.setOnClickListener { triggerSosAction() }
-
-        btnPallet.setOnClickListener {
-            AlertDialog.Builder(this)
-                .setTitle("📦 Pallet Handover QR Verification")
-                .setMessage("Shipment ID: SHP-8492\nCargo: Vaccines & Insulin (1,450 kg)\nCold Integrity: VERIFIED (4.1°C)\nDigital Seal: MATCHED (SHA-256 Validated)\n\nConfirm physical custody release to rescue vehicle?")
-                .setPositiveButton("Confirm Handover") { _, _ ->
-                    badgeStatus.text = "ESCROW RELEASED"
-                    badgeStatus.setBackgroundResource(R.drawable.bg_pill_demo)
-                    badgeStatus.setTextColor(ContextCompat.getColor(this, R.color.uber_teal))
-                    Toast.makeText(this, "Pallet transfer verified. Smart contract released.", Toast.LENGTH_LONG).show()
-                }
-                .setNegativeButton("Cancel", null)
-                .show()
-        }
-
-        btnReefer.setOnClickListener {
-            AlertDialog.Builder(this)
-                .setTitle("❄️ Cold Chain Telemetry")
-                .setMessage("Cargo Chamber: +4.1°C (Nominal)\nSetpoint Band: +2.0°C to +8.0°C\nAmbient Outdoor: +34.8°C\nCompressor Duty: 92%\nBattery Backup: 98%\nIoT Link: Nominal LTE")
-                .setPositiveButton("Done", null)
-                .show()
-        }
-
-        btnHubs.setOnClickListener {
-            AlertDialog.Builder(this)
-                .setTitle("🏢 Nearest Cold Storage Network")
-                .setMessage("1. Pune Cold Logistics Hub (14.2 km)\n2. Panvel Transshipment Terminal (28.6 km)\n3. Khopoli Expressway Reefer Dock (8.1 km)")
-                .setPositiveButton("Close", null)
-                .show()
-        }
-
-        contentFrame.addView(view)
-    }
-
-    // ==========================================
-    // 2. SERVICES SCREEN (1:1 UBER SERVICES)
-    // ==========================================
-    private fun renderServicesScreen(inflater: LayoutInflater) {
-        val view = inflater.inflate(R.layout.view_services, contentFrame, false)
-
-        val inputDist = view.findViewById<EditText>(R.id.input_distance)
-        val btnReefer = view.findViewById<LinearLayout>(R.id.btn_veh_reefer)
-        val btnAce = view.findViewById<LinearLayout>(R.id.btn_veh_ace)
-        val btnBolero = view.findViewById<LinearLayout>(R.id.btn_veh_bolero)
-
-        val txtFareReefer = view.findViewById<TextView>(R.id.txt_fare_reefer)
-        val txtFareAce = view.findViewById<TextView>(R.id.txt_fare_ace)
-        val txtFareBolero = view.findViewById<TextView>(R.id.txt_fare_bolero)
-
-        val calculateFares = {
-            val dist = inputDist.text.toString().toDoubleOrNull() ?: 85.0
-            val reeferFare = (1200 + dist * 40).toInt()
-            val aceFare = (600 + dist * 15).toInt()
-            val boleroFare = (800 + dist * 20).toInt()
-
-            txtFareReefer.text = "₹$reeferFare"
-            txtFareAce.text = "₹$aceFare"
-            txtFareBolero.text = "₹$boleroFare"
-        }
-
-        inputDist.addTextChangedListener(object : android.text.TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
-                calculateFares()
-            }
-            override fun afterTextChanged(s: android.text.Editable?) {}
-        })
-
-        btnReefer.setOnClickListener {
-            btnReefer.setBackgroundResource(R.drawable.bg_pill_button)
-            btnAce.setBackgroundResource(R.drawable.bg_pill_demo)
-            btnBolero.setBackgroundResource(R.drawable.bg_pill_demo)
-            Toast.makeText(this, "Selected: Tata Ultra Reefer (-20°C)", Toast.LENGTH_SHORT).show()
-        }
-
-        btnAce.setOnClickListener {
-            btnAce.setBackgroundResource(R.drawable.bg_pill_button)
-            btnReefer.setBackgroundResource(R.drawable.bg_pill_demo)
-            btnBolero.setBackgroundResource(R.drawable.bg_pill_demo)
-            Toast.makeText(this, "Selected: Tata Ace (750 kg)", Toast.LENGTH_SHORT).show()
-        }
-
-        btnBolero.setOnClickListener {
-            btnBolero.setBackgroundResource(R.drawable.bg_pill_button)
-            btnReefer.setBackgroundResource(R.drawable.bg_pill_demo)
-            btnAce.setBackgroundResource(R.drawable.bg_pill_demo)
-            Toast.makeText(this, "Selected: Bolero Maxi (1.2 T)", Toast.LENGTH_SHORT).show()
-        }
-
-        view.findViewById<LinearLayout>(R.id.card_service_reefer).setOnClickListener {
-            Toast.makeText(this, "Service: Cold-chain Reefer Rescue (Active)", Toast.LENGTH_SHORT).show()
-        }
-        view.findViewById<LinearLayout>(R.id.card_service_hauler).setOnClickListener {
-            Toast.makeText(this, "Service: Heavy Breakdown Hauler (Available)", Toast.LENGTH_SHORT).show()
-        }
-        view.findViewById<LinearLayout>(R.id.card_service_hazmat).setOnClickListener {
-            Toast.makeText(this, "Service: Hazmat ADR Certified Recovery", Toast.LENGTH_SHORT).show()
-        }
-        view.findViewById<LinearLayout>(R.id.card_service_crossdock).setOnClickListener {
-            Toast.makeText(this, "Service: Immediate Dock-to-Dock Transfer", Toast.LENGTH_SHORT).show()
-        }
-
-        contentFrame.addView(view)
-    }
-
-    // ==========================================
-    // 3. ACTIVITY SCREEN (1:1 UBER ACTIVITY)
-    // ==========================================
-    private fun renderActivityScreen(inflater: LayoutInflater) {
-        val view = inflater.inflate(R.layout.view_activity, contentFrame, false)
-
-        val btnFilter = view.findViewById<LinearLayout>(R.id.btn_filter_activity)
-        btnFilter.setOnClickListener {
-            // 1:1 Uber Dark Activity Filter Bottom Sheet
-            val bottomSheet = BottomSheetDialog(this)
-            val container = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(48, 48, 48, 64)
-                setBackgroundColor(ContextCompat.getColor(context, R.color.uber_pill_dark))
-
-                val title = TextView(context).apply {
-                    text = "Activity Filters"
-                    setTextColor(ContextCompat.getColor(context, R.color.uber_white))
-                    textSize = 20f
-                    typeface = android.graphics.Typeface.DEFAULT_BOLD
-                }
-                addView(title)
-
-                val opt1 = TextView(context).apply {
-                    text = "✓ All Rescues & Deliveries"
-                    setTextColor(ContextCompat.getColor(context, R.color.uber_teal_soft))
-                    textSize = 14f
-                    setPadding(0, 32, 0, 16)
-                }
-                addView(opt1)
-
-                val opt2 = TextView(context).apply {
-                    text = "Cold Chain Only (< 8°C)"
-                    setTextColor(ContextCompat.getColor(context, R.color.uber_white))
-                    textSize = 14f
-                    setPadding(0, 16, 0, 16)
-                }
-                addView(opt2)
-
-                val opt3 = TextView(context).apply {
-                    text = "Escrow Released Trips"
-                    setTextColor(ContextCompat.getColor(context, R.color.uber_white))
-                    textSize = 14f
-                    setPadding(0, 16, 0, 32)
-                }
-                addView(opt3)
-
-                val closeBtn = Button(context).apply {
-                    text = "Apply Filters"
-                    setBackgroundResource(R.drawable.bg_pill_button)
-                    setTextColor(ContextCompat.getColor(context, R.color.uber_white))
-                    setOnClickListener { bottomSheet.dismiss() }
-                }
-                addView(closeBtn)
-            }
-            bottomSheet.setContentView(container)
-            bottomSheet.show()
-        }
-
-        contentFrame.addView(view)
-    }
-
-    // ==========================================
-    // 4. ACCOUNT SCREEN (1:1 UBER ACCOUNT)
-    // ==========================================
-    private fun renderAccountScreen(inflater: LayoutInflater) {
-        val view = inflater.inflate(R.layout.view_account, contentFrame, false)
-
-        val txtName = view.findViewById<TextView>(R.id.txt_account_name)
-        val btnSignOut = view.findViewById<LinearLayout>(R.id.btn_sign_out)
-        val btnSafety = view.findViewById<LinearLayout>(R.id.btn_action_safety)
-        val btnWallet = view.findViewById<LinearLayout>(R.id.btn_action_wallet)
-        val btnHelp = view.findViewById<LinearLayout>(R.id.btn_action_help)
-
-        currentSession?.let {
-            txtName.text = it.driverName
-        }
-
-        btnSafety.setOnClickListener {
-            AlertDialog.Builder(this)
-                .setTitle("🛡️ Safety Hub")
-                .setMessage("GPS Live Tracking: Active\nAutomated Spoilage Sentinel: Nominal\nEscrow Insurance: Covered up to ₹25,00,000")
+                .setTitle("Location is needed")
+                .setMessage(getString(R.string.permission_location_rationale))
                 .setPositiveButton("OK", null)
                 .show()
         }
+    }
 
-        btnWallet.setOnClickListener {
-            AlertDialog.Builder(this)
-                .setTitle("💳 Driver Earnings")
-                .setMessage("Current Month: ₹1,24,800\nCompleted Rescues: 18\nOn-time SLA: 99.4%\nNext Payout: Friday")
-                .setPositiveButton("Close", null)
-                .show()
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* The foreground service runs either way; the notification is the OS's. */ }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        Session.init(applicationContext)
+
+        // osmdroid needs a user agent per OpenStreetMap's tile policy, and a
+        // cache directory, before any MapView is inflated.
+        Configuration.getInstance().apply {
+            load(applicationContext, getSharedPreferences("osmdroid", Context.MODE_PRIVATE))
+            userAgentValue = packageName
+            osmdroidBasePath = cacheDir
+            osmdroidTileCache = java.io.File(cacheDir, "tiles")
         }
 
-        btnHelp.setOnClickListener {
-            val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:1033"))
-            try {
-                startActivity(intent)
-            } catch (_: Exception) {
-                Toast.makeText(this, "NHAI Helpline: 1033", Toast.LENGTH_LONG).show()
+        setContentView(R.layout.activity_main)
+        contentFrame = findViewById(R.id.content_frame)
+        navBar = findViewById(R.id.floating_nav_bar)
+
+        setupNavigation()
+
+        if (Session.isSignedIn) {
+            showApp()
+        } else {
+            showAuth()
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        homeMap?.onResume()
+    }
+
+    override fun onPause() {
+        homeMap?.onPause()
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        tickerJob?.cancel()
+        super.onDestroy()
+    }
+
+    // ------------------------------------------------------------------
+    // Navigation
+    // ------------------------------------------------------------------
+
+    private fun setupNavigation() {
+        findViewById<LinearLayout>(R.id.tab_home).setOnClickListener { switchTab(TAB_HOME) }
+        findViewById<LinearLayout>(R.id.tab_jobs).setOnClickListener { switchTab(TAB_JOBS) }
+        findViewById<LinearLayout>(R.id.tab_sos).setOnClickListener { switchTab(TAB_SOS) }
+        findViewById<LinearLayout>(R.id.tab_safety).setOnClickListener { switchTab(TAB_SAFETY) }
+        findViewById<LinearLayout>(R.id.tab_account).setOnClickListener { switchTab(TAB_ACCOUNT) }
+    }
+
+    private fun switchTab(index: Int) {
+        currentTab = index
+        updateNavStyles()
+        contentFrame.removeAllViews()
+        homeMap = null
+
+        val inflater = LayoutInflater.from(this)
+        when (index) {
+            TAB_HOME -> renderHome(inflater)
+            TAB_JOBS -> renderJobs(inflater)
+            TAB_SOS -> renderSos(inflater)
+            TAB_SAFETY -> renderSafety(inflater)
+            TAB_ACCOUNT -> renderAccount(inflater)
+        }
+    }
+
+    private fun updateNavStyles() {
+        val active = ContextCompat.getColor(this, R.color.white)
+        val muted = ContextCompat.getColor(this, R.color.muted)
+        val pairs = listOf(
+            TAB_HOME to (R.id.icon_home to R.id.text_home),
+            TAB_JOBS to (R.id.icon_jobs to R.id.text_jobs),
+            TAB_SOS to (R.id.icon_sos to R.id.text_sos),
+            TAB_SAFETY to (R.id.icon_safety to R.id.text_safety),
+            TAB_ACCOUNT to (R.id.icon_account to R.id.text_account),
+        )
+        pairs.forEach { (tab, ids) ->
+            val isActive = tab == currentTab
+            // SOS keeps its red tint even when inactive, so the eye finds it.
+            val tint = when {
+                tab == TAB_SOS -> ContextCompat.getColor(this, R.color.red_soft)
+                isActive -> active
+                else -> muted
+            }
+            findViewById<ImageView>(ids.first).setColorFilter(if (isActive) active else tint)
+            findViewById<TextView>(ids.second).setTextColor(if (isActive) active else tint)
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Auth
+    // ------------------------------------------------------------------
+
+    private fun showAuth() {
+        navBar.visibility = View.GONE
+        contentFrame.removeAllViews()
+        val view = LayoutInflater.from(this).inflate(R.layout.view_auth, contentFrame, false)
+
+        val baseUrlInput = view.findViewById<EditText>(R.id.input_base_url)
+        val emailInput = view.findViewById<EditText>(R.id.input_email)
+        val passwordInput = view.findViewById<EditText>(R.id.input_password)
+        val errorText = view.findViewById<TextView>(R.id.text_auth_error)
+        val button = view.findViewById<Button>(R.id.btn_sign_in)
+        val progress = view.findViewById<ProgressBar>(R.id.progress_auth)
+
+        baseUrlInput.setText(Session.baseUrl)
+
+        button.setOnClickListener {
+            val email = emailInput.text.toString().trim()
+            val password = passwordInput.text.toString()
+            if (email.isEmpty() || password.isEmpty()) {
+                errorText.text = "Enter your email and password."
+                errorText.visibility = View.VISIBLE
+                return@setOnClickListener
+            }
+
+            Session.baseUrl = baseUrlInput.text.toString().trim()
+            errorText.visibility = View.GONE
+            button.isEnabled = false
+            progress.visibility = View.VISIBLE
+
+            lifecycleScope.launch {
+                val result = CargoResQApi.login(email, password)
+                progress.visibility = View.GONE
+                button.isEnabled = true
+
+                result.onSuccess { session ->
+                    Session.save(session)
+                    showApp()
+                }.onFailure { error ->
+                    // A real failure, shown as one. The previous build
+                    // returned a fabricated session here and let the driver
+                    // believe they were signed in.
+                    errorText.text = error.message ?: "Sign in failed."
+                    errorText.visibility = View.VISIBLE
+                }
             }
         }
 
-        btnSignOut.setOnClickListener {
-            currentSession = null
-            showAuthScreen()
+        contentFrame.addView(view)
+    }
+
+    private fun showApp() {
+        navBar.visibility = View.VISIBLE
+        switchTab(TAB_HOME)
+        loadEverything()
+    }
+
+    private fun signOut() {
+        stopDuty()
+        Session.clear()
+        profile = null
+        shipment = null
+        incident = null
+        offers = emptyList()
+        showAuth()
+    }
+
+    // ------------------------------------------------------------------
+    // Data
+    // ------------------------------------------------------------------
+
+    private fun loadEverything(onDone: (() -> Unit)? = null) {
+        val token = Session.token ?: return
+        lifecycleScope.launch {
+            CargoResQApi.profile(token).onSuccess { profile = it }
+            CargoResQApi.activeShipment(token).onSuccess { shipment = it }
+            CargoResQApi.activeIncident(token).onSuccess { incident = it }
+            CargoResQApi.offerInbox(token).onSuccess { offers = it }
+            if (emergencyNumbers.isEmpty()) {
+                CargoResQApi.emergencyNumbers().onSuccess { emergencyNumbers = it }
+            }
+            if (currentTab == TAB_HOME) switchTab(TAB_HOME) else switchTab(currentTab)
+            onDone?.invoke()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Home
+    // ------------------------------------------------------------------
+
+    @SuppressLint("SetTextI18n")
+    private fun renderHome(inflater: LayoutInflater) {
+        val view = inflater.inflate(R.layout.view_home, contentFrame, false)
+
+        view.findViewById<TextView>(R.id.text_driver_name).text =
+            profile?.name ?: Session.current?.driverName ?: "Driver"
+
+        val truck = profile?.truck
+        view.findViewById<TextView>(R.id.text_truck_summary).text = when {
+            truck == null -> "No truck assigned"
+            truck.refrigerated -> truck.registrationNumber + " - reefer"
+            else -> truck.registrationNumber
+        }
+
+        val dutyBadge = view.findViewById<TextView>(R.id.badge_duty)
+        val dutyButton = view.findViewById<Button>(R.id.btn_duty_toggle)
+        val telemetryStatus = view.findViewById<TextView>(R.id.text_telemetry_status)
+        renderDutyState(dutyBadge, dutyButton, telemetryStatus)
+
+        dutyButton.setOnClickListener {
+            if (onDuty) {
+                stopDuty()
+            } else {
+                requestLocationThenStart()
+            }
+            renderDutyState(dutyBadge, dutyButton, telemetryStatus)
+        }
+
+        // -- the map --
+        val map = view.findViewById<MapView>(R.id.map_home)
+        val mapStatus = view.findViewById<TextView>(R.id.text_map_status)
+        setupMap(map, mapStatus)
+        homeMap = map
+        view.findViewById<Button>(R.id.btn_recentre).setOnClickListener { recentreMap() }
+
+        // -- active incident --
+        incident?.let { inc ->
+            view.findViewById<LinearLayout>(R.id.card_incident).visibility = View.VISIBLE
+            view.findViewById<TextView>(R.id.text_incident_state).text =
+                inc.state.replace('_', ' ').lowercase().replaceFirstChar { it.uppercase() }
+            val spoilage = inc.minutesUntilSpoilage
+            view.findViewById<TextView>(R.id.text_incident_detail).text = buildString {
+                append(inc.cargoType ?: "Your load")
+                if (spoilage != null) {
+                    append(" - ")
+                    append(spoilage.toInt())
+                    append(" min before the cargo is at risk")
+                }
+            }
+        }
+
+        // -- assigned load --
+        val cargoTitle = view.findViewById<TextView>(R.id.text_cargo_type)
+        val cargoDetail = view.findViewById<TextView>(R.id.text_cargo_detail)
+        val conditionsRow = view.findViewById<LinearLayout>(R.id.row_cargo_conditions)
+        conditionsRow.removeAllViews()
+
+        val load = shipment
+        if (load == null) {
+            cargoTitle.text = "No load assigned"
+            cargoDetail.text = "Your dispatcher has not assigned a shipment to this truck."
+        } else {
+            cargoTitle.text = load.cargoType
+            cargoDetail.text =
+                formatWeight(load.weightKg) + " - " + formatMoney(load.valueInr) + " declared value"
+            if (load.requiresRefrigeration) {
+                val limit = load.requiredMaxTempC
+                conditionsRow.addView(
+                    chip(if (limit != null) "Keep below " + limit + "C" else "Refrigerated",
+                        R.color.teal, R.drawable.bg_badge_teal)
+                )
+            }
+            if (load.isHazmat) {
+                conditionsRow.addView(chip("Hazmat", R.color.red, R.drawable.bg_badge_red))
+            }
+        }
+
+        // -- manual condition logging, only for a reefer load --
+        val conditionCard = view.findViewById<LinearLayout>(R.id.card_condition)
+        if (load != null && load.requiresRefrigeration) {
+            conditionCard.visibility = View.VISIBLE
+            val input = view.findViewById<EditText>(R.id.input_temperature)
+            view.findViewById<Button>(R.id.btn_log_temperature).setOnClickListener {
+                val value = input.text.toString().toDoubleOrNull()
+                if (value == null) {
+                    toast("Enter the temperature shown on the gauge.")
+                    return@setOnClickListener
+                }
+                logTemperature(load, value) { input.setText("") }
+            }
+        }
+
+        view.findViewById<Button>(R.id.btn_report_breakdown).setOnClickListener {
+            confirmBreakdown()
+        }
+
+        val swipe = view.findViewById<SwipeRefreshLayout>(R.id.swipe_home)
+        swipe.setOnRefreshListener { loadEverything { swipe.isRefreshing = false } }
+
+        contentFrame.addView(view)
+    }
+
+    private fun renderDutyState(badge: TextView, button: Button, status: TextView) {
+        if (onDuty) {
+            badge.text = "ON DUTY"
+            badge.setBackgroundResource(R.drawable.bg_badge_teal)
+            badge.setTextColor(ContextCompat.getColor(this, R.color.teal))
+            button.text = "Go off duty"
+            button.setBackgroundResource(R.drawable.bg_pill_outline)
+            button.setTextColor(ContextCompat.getColor(this, R.color.ink))
+
+            val queued = TelemetryService.queueDepth
+            val lastUpload = TelemetryService.lastUploadedAt
+            status.text = when {
+                TelemetryService.lastError != null ->
+                    "Cannot reach dispatch. " + queued + " positions saved on this phone."
+                queued > 0 -> queued.toString() + " positions waiting for signal."
+                lastUpload > 0 -> "Dispatch has your position."
+                else -> "Getting your first position..."
+            }
+        } else {
+            badge.text = "OFF DUTY"
+            badge.setBackgroundResource(R.drawable.bg_badge_amber)
+            badge.setTextColor(ContextCompat.getColor(this, R.color.amber))
+            button.text = "Go on duty"
+            button.setBackgroundResource(R.drawable.bg_pill_primary)
+            button.setTextColor(ContextCompat.getColor(this, R.color.white))
+            status.text = "Position sharing is off. Dispatch cannot see where you are."
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Map
+    // ------------------------------------------------------------------
+
+    private fun setupMap(map: MapView, status: TextView) {
+        map.setTileSource(TileSourceFactory.MAPNIK)
+        map.setMultiTouchControls(true)
+        map.setUseDataConnection(true)
+        map.controller.setZoom(15.0)
+
+        val known = lastKnownLocation ?: readLastKnownLocation()
+        if (known != null) {
+            lastKnownLocation = known
+            val point = GeoPoint(known.latitude, known.longitude)
+            map.controller.setCenter(point)
+            placeDriverMarker(map, point)
+            status.text = "Your position"
+        } else {
+            // A registration coordinate is not a position. Centre on the
+            // country and say so rather than implying a fix we do not have.
+            map.controller.setCenter(GeoPoint(20.5937, 78.9629))
+            map.controller.setZoom(5.0)
+            status.text = if (onDuty) "Waiting for GPS" else "Go on duty to show your position"
+        }
+
+        startLocationTicker(map, status)
+    }
+
+    private fun placeDriverMarker(map: MapView, point: GeoPoint) {
+        driverMarker?.let { map.overlays.remove(it) }
+        val marker = Marker(map).apply {
+            position = point
+            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+            title = profile?.truck?.registrationNumber ?: "You"
+        }
+        map.overlays.add(marker)
+        driverMarker = marker
+        map.invalidate()
+    }
+
+    /** Follow the device's position on the map while the screen is open. */
+    private fun startLocationTicker(map: MapView, status: TextView) {
+        tickerJob?.cancel()
+        tickerJob = lifecycleScope.launch {
+            while (isActive) {
+                delay(5_000)
+                val location = readLastKnownLocation() ?: continue
+                lastKnownLocation = location
+                val point = GeoPoint(location.latitude, location.longitude)
+                placeDriverMarker(map, point)
+                status.text = if (onDuty) "Sharing your position" else "Your position"
+            }
+        }
+    }
+
+    private fun recentreMap() {
+        val location = lastKnownLocation ?: readLastKnownLocation()
+        if (location == null) {
+            toast("No GPS fix yet.")
+            return
+        }
+        homeMap?.controller?.animateTo(GeoPoint(location.latitude, location.longitude))
+        homeMap?.controller?.setZoom(16.0)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun readLastKnownLocation(): Location? {
+        if (!hasLocationPermission()) return null
+        return try {
+            val manager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+            listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+                .mapNotNull { runCatching { manager.getLastKnownLocation(it) }.getOrNull() }
+                .maxByOrNull { it.time }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Duty / telemetry
+    // ------------------------------------------------------------------
+
+    private fun hasLocationPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+
+    private fun requestLocationThenStart() {
+        if (hasLocationPermission()) {
+            startDuty()
+            return
+        }
+        locationPermissionLauncher.launch(
+            arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION,
+            )
+        )
+    }
+
+    private fun startDuty() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        TelemetryService.start(this)
+        onDuty = true
+        toast("On duty. Dispatch can see your position.")
+        if (currentTab == TAB_HOME) switchTab(TAB_HOME)
+    }
+
+    private fun stopDuty() {
+        TelemetryService.stop(this)
+        onDuty = false
+    }
+
+    private fun logTemperature(load: ShipmentInfo, value: Double, onDone: () -> Unit) {
+        val token = Session.token ?: return
+        lifecycleScope.launch {
+            val result = CargoResQApi.uploadReading(
+                token = token,
+                sensorId = Session.deviceId,
+                shipmentId = load.id,
+                recordedAt = isoFormat.format(Date()),
+                temperatureC = value,
+                doorOpen = null,
+                reeferState = null,
+                clientReadingId = UUID.randomUUID().toString().take(16),
+            )
+            result.onSuccess {
+                onDone()
+                val limit = load.requiredMaxTempC
+                if (limit != null && value > limit) {
+                    // Do not soften this. A breach is what disputes a payment.
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("Above the limit")
+                        .setMessage(
+                            "You recorded " + value + "C against a limit of " + limit +
+                                "C. Dispatch has been alerted. Keep the doors shut and " +
+                                "record again in 15 minutes."
+                        )
+                        .setPositiveButton("Understood", null)
+                        .show()
+                } else {
+                    toast("Recorded " + value + "C.")
+                }
+            }.onFailure { toast(it.message ?: "Could not record the reading.") }
+        }
+    }
+
+    private fun confirmBreakdown() {
+        val location = lastKnownLocation ?: readLastKnownLocation()
+        if (location == null) {
+            // Refuse rather than send a made-up coordinate. The previous build
+            // posted a fixed 18.7511, 73.3422 for every breakdown, anywhere in
+            // the country.
+            AlertDialog.Builder(this)
+                .setTitle("No position yet")
+                .setMessage(
+                    "CargoResQ needs your GPS position to send help to the right place. " +
+                        "Go on duty and wait for a fix, then try again."
+                )
+                .setPositiveButton("OK", null)
+                .show()
+            return
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Report a breakdown?")
+            .setMessage(
+                "Your dispatcher will be told your truck cannot continue, and " +
+                    "compatible trucks nearby will be asked to help.\n\nIf anyone is " +
+                    "hurt, use SOS instead."
+            )
+            .setPositiveButton("Report") { _, _ -> sendBreakdown(location) }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun sendBreakdown(location: Location) {
+        val token = Session.token ?: return
+        lifecycleScope.launch {
+            val result = CargoResQApi.reportBreakdown(
+                token = token,
+                latitude = location.latitude,
+                longitude = location.longitude,
+                hoursToSpoilage = null,
+                clientRequestId = "android-" + UUID.randomUUID().toString().take(12),
+            )
+            result.onSuccess {
+                toast("Breakdown reported. Dispatch is looking for help.")
+                loadEverything()
+            }.onFailure { error ->
+                // The failure is shown. It used to return success regardless.
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Not reported")
+                    .setMessage(
+                        (error.message ?: "The report did not go through.") +
+                            "\n\nCall your dispatcher directly."
+                    )
+                    .setPositiveButton("OK", null)
+                    .show()
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Jobs
+    // ------------------------------------------------------------------
+
+    private fun renderJobs(inflater: LayoutInflater) {
+        val view = inflater.inflate(R.layout.view_jobs, contentFrame, false)
+        val list = view.findViewById<RecyclerView>(R.id.list_jobs)
+        val empty = view.findViewById<TextView>(R.id.text_jobs_empty)
+
+        val live = offers.filter { it.state == "PENDING" || it.state == "OWNER_CONFIRMED" }
+        empty.visibility = if (live.isEmpty()) View.VISIBLE else View.GONE
+
+        list.layoutManager = LinearLayoutManager(this)
+        list.adapter = JobAdapter(live)
+
+        val swipe = view.findViewById<SwipeRefreshLayout>(R.id.swipe_jobs)
+        swipe.setOnRefreshListener { loadEverything { swipe.isRefreshing = false } }
+
+        contentFrame.addView(view)
+    }
+
+    private inner class JobAdapter(private val items: List<OfferInfo>) :
+        RecyclerView.Adapter<JobAdapter.JobViewHolder>() {
+
+        inner class JobViewHolder(view: View) : RecyclerView.ViewHolder(view) {
+            val eta: TextView = view.findViewById(R.id.text_job_eta)
+            val detail: TextView = view.findViewById(R.id.text_job_detail)
+            val expiry: TextView = view.findViewById(R.id.text_job_expiry)
+            val badge: TextView = view.findViewById(R.id.badge_job_state)
+            val accept: Button = view.findViewById(R.id.btn_job_accept)
+            val decline: Button = view.findViewById(R.id.btn_job_decline)
+        }
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): JobViewHolder =
+            JobViewHolder(
+                LayoutInflater.from(parent.context).inflate(R.layout.item_job, parent, false)
+            )
+
+        override fun getItemCount(): Int = items.size
+
+        @SuppressLint("SetTextI18n")
+        override fun onBindViewHolder(holder: JobViewHolder, position: Int) {
+            val offer = items[position]
+            val eta = offer.etaMinutes
+            holder.eta.text = if (eta != null) eta.toInt().toString() + " min away" else "Nearby"
+            holder.detail.text = buildString {
+                offer.distanceKm?.let { append(String.format(Locale.US, "%.1f km", it)) }
+                if (offer.ownerConfirmed) {
+                    append(if (isEmpty()) "" else "  -  ")
+                    append("Customer is waiting on you")
+                }
+            }
+
+            holder.badge.text = offer.state.replace('_', ' ')
+            holder.expiry.text = describeExpiry(offer.expiresAt)
+
+            holder.accept.setOnClickListener { acceptOffer(offer) }
+            holder.decline.setOnClickListener { declineOffer(offer) }
+        }
+    }
+
+    /** How long is left to answer, in words. */
+    private fun describeExpiry(expiresAt: String?): String {
+        if (expiresAt == null) return ""
+        val parsed = runCatching {
+            val normalised = expiresAt.replace("Z", "+0000").replace(Regex("([+-]\\d{2}):(\\d{2})$"), "$1$2")
+            SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss[.SSS]Z", Locale.US).parse(normalised)
+        }.getOrNull() ?: return ""
+
+        val seconds = (parsed.time - System.currentTimeMillis()) / 1000
+        return when {
+            seconds <= 0 -> "Expired"
+            seconds < 60 -> seconds.toString() + " seconds to answer"
+            else -> (seconds / 60).toString() + " minutes to answer"
+        }
+    }
+
+    private fun acceptOffer(offer: OfferInfo) {
+        val token = Session.token ?: return
+        lifecycleScope.launch {
+            CargoResQApi.acceptOffer(token, offer.id)
+                .onSuccess { bound ->
+                    // Accepting is half a handshake. Saying so prevents a
+                    // driver setting off for a job that is not yet theirs.
+                    toast(
+                        if (bound) "Job confirmed. Head to the pickup."
+                        else "Accepted. Waiting for the customer to confirm."
+                    )
+                    loadEverything()
+                }
+                .onFailure { toast(it.message ?: "Could not accept.") }
+        }
+    }
+
+    private fun declineOffer(offer: OfferInfo) {
+        val token = Session.token ?: return
+        lifecycleScope.launch {
+            CargoResQApi.declineOffer(token, offer.id, "Declined by driver")
+                .onSuccess { loadEverything() }
+                .onFailure { toast(it.message ?: "Could not decline.") }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // SOS
+    // ------------------------------------------------------------------
+
+    private var selectedCategory: SosCategory = SosCategory.MECHANICAL
+
+    @SuppressLint("SetTextI18n")
+    private fun renderSos(inflater: LayoutInflater) {
+        val view = inflater.inflate(R.layout.view_sos, contentFrame, false)
+
+        view.findViewById<Button>(R.id.btn_call_112).setOnClickListener { dial("112") }
+
+        // Quick-dial row for the specific services.
+        val numbersRow = view.findViewById<LinearLayout>(R.id.row_emergency_numbers)
+        numbersRow.removeAllViews()
+        val numbers = emergencyNumbers.ifEmpty { defaultEmergencyNumbers() }
+        numbers.filter { !it.primary }.forEach { number ->
+            numbersRow.addView(dialChip(number))
+        }
+
+        // Category tiles.
+        val grid = view.findViewById<GridLayout>(R.id.grid_sos_categories)
+        grid.removeAllViews()
+        val tiles = mutableMapOf<SosCategory, TextView>()
+        SosCategory.values().forEach { category ->
+            val tile = categoryTile(category)
+            tile.isSelected = category == selectedCategory
+            tile.setOnClickListener {
+                selectedCategory = category
+                tiles.forEach { (c, t) -> t.isSelected = c == category }
+            }
+            tiles[category] = tile
+            grid.addView(tile)
+        }
+
+        // Location, read now and refreshed by the ticker.
+        val locationText = view.findViewById<TextView>(R.id.text_sos_location)
+        val location = lastKnownLocation ?: readLastKnownLocation()
+        locationText.text = if (location != null) {
+            lastKnownLocation = location
+            String.format(Locale.US, "%.5f, %.5f", location.latitude, location.longitude) +
+                "  (accurate to " + location.accuracy.toInt() + " m)"
+        } else {
+            "No GPS fix. Describe where you are below so help can find you."
+        }
+
+        val resultText = view.findViewById<TextView>(R.id.text_sos_result)
+        view.findViewById<Button>(R.id.btn_send_sos).setOnClickListener {
+            sendSos(view, resultText)
         }
 
         contentFrame.addView(view)
+    }
+
+    private fun categoryTile(category: SosCategory): TextView {
+        val tile = TextView(this).apply {
+            text = category.label
+            gravity = android.view.Gravity.CENTER
+            setBackgroundResource(R.drawable.bg_sos_tile)
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.ink))
+            textSize = 13f
+            setPadding(8, 24, 8, 24)
+        }
+        val params = GridLayout.LayoutParams().apply {
+            width = 0
+            height = GridLayout.LayoutParams.WRAP_CONTENT
+            columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
+            setMargins(6, 6, 6, 6)
+        }
+        tile.layoutParams = params
+        return tile
+    }
+
+    private fun dialChip(number: EmergencyNumber): View {
+        val chip = TextView(this).apply {
+            text = number.label + "  " + number.number
+            setBackgroundResource(R.drawable.bg_pill_outline)
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.ink))
+            textSize = 12f
+            setPadding(28, 18, 28, 18)
+            setOnClickListener { dial(number.number) }
+        }
+        val params = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { setMargins(0, 0, 10, 0) }
+        chip.layoutParams = params
+        return chip
+    }
+
+    /**
+     * Open the dialer with the number filled in.
+     *
+     * ACTION_DIAL, never ACTION_CALL: the driver presses the green button.
+     * Placing an emergency call automatically is not a decision an app should
+     * make, and the app does not hold CALL_PHONE.
+     */
+    private fun dial(number: String) {
+        try {
+            startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + number)))
+        } catch (e: Exception) {
+            toast("No dialler on this device. Call " + number + " manually.")
+        }
+    }
+
+    private fun defaultEmergencyNumbers(): List<EmergencyNumber> = listOf(
+        EmergencyNumber("All emergencies", "112", true),
+        EmergencyNumber("Ambulance", "108", false),
+        EmergencyNumber("Police", "100", false),
+        EmergencyNumber("Fire", "101", false),
+        EmergencyNumber("Highway", "1033", false),
+    )
+
+    private fun sendSos(view: View, resultText: TextView) {
+        val token = Session.token ?: return
+        val location = lastKnownLocation ?: readLastKnownLocation()
+
+        if (location == null) {
+            AlertDialog.Builder(this)
+                .setTitle("No position")
+                .setMessage(
+                    "CargoResQ cannot tell anyone where you are without a GPS fix.\n\n" +
+                        "Call 112 now and describe your location."
+                )
+                .setPositiveButton("Call 112") { _, _ -> dial("112") }
+                .setNegativeButton("Cancel", null)
+                .show()
+            return
+        }
+
+        val severity = when (view.findViewById<RadioGroup>(R.id.group_severity).checkedRadioButtonId) {
+            R.id.radio_critical -> SosSeverity.CRITICAL
+            R.id.radio_moderate -> SosSeverity.MODERATE
+            else -> SosSeverity.HIGH
+        }
+
+        val injured = view.findViewById<CheckBox>(R.id.check_injured).isChecked
+        val condition = DriverCondition(
+            personsAffected = view.findViewById<EditText>(R.id.input_persons)
+                .text.toString().toIntOrNull(),
+            isConscious = true,
+            isTrapped = view.findViewById<CheckBox>(R.id.check_trapped).isChecked,
+            isMobile = view.findViewById<CheckBox>(R.id.check_mobile).isChecked,
+            severeBleeding = view.findViewById<CheckBox>(R.id.check_bleeding).isChecked,
+            note = view.findViewById<EditText>(R.id.input_condition_note).text.toString(),
+        )
+
+        lifecycleScope.launch {
+            val result = CargoResQApi.raiseSos(
+                token = token,
+                category = selectedCategory,
+                severity = severity,
+                latitude = location.latitude,
+                longitude = location.longitude,
+                accuracyM = if (location.hasAccuracy()) location.accuracy else null,
+                landmarkNote = view.findViewById<EditText>(R.id.input_landmark).text.toString(),
+                condition = condition,
+                silentMode = view.findViewById<CheckBox>(R.id.check_silent).isChecked,
+                clientRequestId = "sos-" + UUID.randomUUID().toString().take(14),
+            )
+
+            result.onSuccess { alert ->
+                resultText.visibility = View.VISIBLE
+                resultText.setTextColor(ContextCompat.getColor(this@MainActivity, R.color.teal))
+                resultText.text =
+                    "Alert sent. Your company and nearby trucks have been told."
+
+                // The confirmation restates what did and did not happen.
+                val message = StringBuilder()
+                message.append("Your company has been alerted")
+                if (selectedCategory != SosCategory.POLICE_SECURITY) {
+                    message.append(", and so have carriers with trucks near you")
+                }
+                message.append(".\n\n")
+                if (!alert.psapDispatched) {
+                    message.append(
+                        "No ambulance, police or fire service has been called. " +
+                            "If you need one, tap Call 112."
+                    )
+                }
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Alert sent")
+                    .setMessage(message.toString())
+                    .setPositiveButton("Call 112") { _, _ -> dial("112") }
+                    .setNegativeButton("Close", null)
+                    .show()
+            }.onFailure { error ->
+                resultText.visibility = View.VISIBLE
+                resultText.setTextColor(ContextCompat.getColor(this@MainActivity, R.color.red))
+                resultText.text = error.message ?: "The alert did not send."
+
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Alert NOT sent")
+                    .setMessage(
+                        (error.message ?: "Could not reach CargoResQ.") +
+                            "\n\nCall 112 or your dispatcher directly. Do not wait."
+                    )
+                    .setPositiveButton("Call 112") { _, _ -> dial("112") }
+                    .setNegativeButton("Close", null)
+                    .show()
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Safety
+    // ------------------------------------------------------------------
+
+    private fun renderSafety(inflater: LayoutInflater) {
+        val view = inflater.inflate(R.layout.view_safety, contentFrame, false)
+        val guidance = SafetyGuidance.forShipment(shipment)
+
+        view.findViewById<TextView>(R.id.text_safety_context).text = guidance.context
+
+        val dos = view.findViewById<LinearLayout>(R.id.list_dos)
+        dos.removeAllViews()
+        guidance.dos.forEach { dos.addView(bulletRow(it, R.color.teal)) }
+
+        val donts = view.findViewById<LinearLayout>(R.id.list_donts)
+        donts.removeAllViews()
+        guidance.donts.forEach { donts.addView(bulletRow(it, R.color.red)) }
+
+        val numbersList = view.findViewById<LinearLayout>(R.id.list_emergency_numbers)
+        numbersList.removeAllViews()
+        emergencyNumbers.ifEmpty { defaultEmergencyNumbers() }.forEach { number ->
+            numbersList.addView(numberRow(number))
+        }
+
+        val contacts = view.findViewById<LinearLayout>(R.id.list_contacts)
+        loadContacts(contacts)
+        view.findViewById<Button>(R.id.btn_add_contact).setOnClickListener {
+            promptAddContact(contacts)
+        }
+
+        contentFrame.addView(view)
+    }
+
+    private fun bulletRow(text: String, colorRes: Int): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 10, 0, 10)
+        }
+        row.addView(TextView(this).apply {
+            this.text = if (colorRes == R.color.red) "x" else "+"
+            setTextColor(ContextCompat.getColor(this@MainActivity, colorRes))
+            textSize = 15f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(60, LinearLayout.LayoutParams.WRAP_CONTENT)
+        })
+        row.addView(TextView(this).apply {
+            this.text = text
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.ink))
+            textSize = 14f
+        })
+        return row
+    }
+
+    private fun numberRow(number: EmergencyNumber): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            setBackgroundResource(R.drawable.bg_card)
+            setPadding(32, 28, 32, 28)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { setMargins(0, 0, 0, 20) }
+            setOnClickListener { dial(number.number) }
+        }
+        row.addView(TextView(this).apply {
+            text = number.label
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.ink))
+            textSize = 15f
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        row.addView(TextView(this).apply {
+            text = number.number
+            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.teal))
+            textSize = 17f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+        })
+        return row
+    }
+
+    private fun loadContacts(container: LinearLayout) {
+        val token = Session.token ?: return
+        container.removeAllViews()
+        lifecycleScope.launch {
+            CargoResQApi.emergencyContacts(token)
+                .onSuccess { contacts ->
+                    if (contacts.isEmpty()) {
+                        container.addView(TextView(this@MainActivity).apply {
+                            text = "No personal contacts yet. Add the people who should be " +
+                                "told if something happens to you."
+                            setTextColor(ContextCompat.getColor(this@MainActivity, R.color.muted))
+                            textSize = 12f
+                        })
+                    }
+                    contacts.forEach { contact ->
+                        container.addView(
+                            numberRow(
+                                EmergencyNumber(
+                                    label = contact.name +
+                                        (contact.relationship?.let { " (" + it + ")" } ?: ""),
+                                    number = contact.phone,
+                                    primary = contact.isPrimary,
+                                )
+                            )
+                        )
+                    }
+                }
+                .onFailure {
+                    container.addView(TextView(this@MainActivity).apply {
+                        text = it.message ?: "Could not load contacts."
+                        setTextColor(ContextCompat.getColor(this@MainActivity, R.color.red))
+                        textSize = 12f
+                    })
+                }
+        }
+    }
+
+    private fun promptAddContact(container: LinearLayout) {
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(60, 40, 60, 10)
+        }
+        val nameInput = EditText(this).apply { hint = "Name" }
+        val phoneInput = EditText(this).apply {
+            hint = "Phone"
+            inputType = android.text.InputType.TYPE_CLASS_PHONE
+        }
+        val relationInput = EditText(this).apply { hint = "Relationship (optional)" }
+        layout.addView(nameInput)
+        layout.addView(phoneInput)
+        layout.addView(relationInput)
+
+        AlertDialog.Builder(this)
+            .setTitle("Add an emergency contact")
+            .setView(layout)
+            .setPositiveButton("Add") { _, _ ->
+                val token = Session.token ?: return@setPositiveButton
+                val name = nameInput.text.toString().trim()
+                val phone = phoneInput.text.toString().trim()
+                if (name.isEmpty() || phone.isEmpty()) {
+                    toast("Name and phone are both needed.")
+                    return@setPositiveButton
+                }
+                lifecycleScope.launch {
+                    CargoResQApi.addEmergencyContact(
+                        token, name, phone, relationInput.text.toString().trim()
+                    ).onSuccess { loadContacts(container) }
+                        .onFailure { toast(it.message ?: "Could not add the contact.") }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // ------------------------------------------------------------------
+    // Account
+    // ------------------------------------------------------------------
+
+    @SuppressLint("SetTextI18n")
+    private fun renderAccount(inflater: LayoutInflater) {
+        val view = inflater.inflate(R.layout.view_account, contentFrame, false)
+
+        view.findViewById<TextView>(R.id.text_account_name).text =
+            profile?.name ?: Session.current?.driverName ?: "Driver"
+        view.findViewById<TextView>(R.id.text_account_email).text =
+            profile?.email ?: Session.current?.email.orEmpty()
+
+        val truck = profile?.truck
+        view.findViewById<TextView>(R.id.text_account_truck).text =
+            truck?.registrationNumber ?: "No truck assigned"
+        view.findViewById<TextView>(R.id.text_account_truck_detail).text = when {
+            truck == null -> "Ask your dispatcher to assign one."
+            truck.refrigerated -> {
+                val floor = truck.minTempC
+                "Refrigerated" + (if (floor != null) " - holds down to " + floor + "C" else "")
+            }
+            else -> "Dry van"
+        }
+
+        view.findViewById<TextView>(R.id.text_account_telemetry).text = if (onDuty) {
+            "On duty. " + TelemetryService.queueDepth + " positions queued."
+        } else {
+            "Off duty. Nothing is being sent."
+        }
+
+        view.findViewById<TextView>(R.id.text_account_server).text = Session.baseUrl
+        view.findViewById<Button>(R.id.btn_sign_out).setOnClickListener {
+            AlertDialog.Builder(this)
+                .setTitle("Sign out?")
+                .setMessage("Position sharing will stop and your dispatcher will lose sight of you.")
+                .setPositiveButton("Sign out") { _, _ -> signOut() }
+                .setNegativeButton("Stay", null)
+                .show()
+        }
+
+        contentFrame.addView(view)
+    }
+
+    // ------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------
+
+    private fun chip(text: String, colorRes: Int, backgroundRes: Int): View {
+        val chip = TextView(this).apply {
+            this.text = text
+            setBackgroundResource(backgroundRes)
+            setTextColor(ContextCompat.getColor(this@MainActivity, colorRes))
+            textSize = 11f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setPadding(24, 12, 24, 12)
+        }
+        chip.layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { setMargins(0, 0, 16, 0) }
+        return chip
+    }
+
+    /** Indian numbering: lakhs and crores, because that is how it is read. */
+    private fun formatMoney(amount: Double): String = when {
+        amount >= 10_000_000 -> String.format(Locale.US, "INR %.2f Cr", amount / 10_000_000)
+        amount >= 100_000 -> String.format(Locale.US, "INR %.2f L", amount / 100_000)
+        else -> String.format(Locale.US, "INR %,.0f", amount)
+    }
+
+    private fun formatWeight(kg: Double): String =
+        if (kg >= 1000) String.format(Locale.US, "%.1f t", kg / 1000)
+        else String.format(Locale.US, "%.0f kg", kg)
+
+    private fun toast(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 }

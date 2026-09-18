@@ -7,7 +7,13 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..auth import create_access_token, get_current_driver, hash_password, verify_password
+from ..auth import (
+    create_access_token,
+    get_current_company_principal,
+    get_current_driver,
+    hash_password,
+    verify_password,
+)
 from ..database import get_db
 from ..models import Company, Driver, Shipment, Truck
 from services.orchestrator.app.models import Incident
@@ -17,10 +23,17 @@ router = APIRouter(prefix="/api/v1/driver", tags=["driver"])
 
 
 class DriverRegisterRequest(BaseModel):
-    company_id: str = Field(..., min_length=3)
+    """Driver onboarding, performed by the employing company.
+
+    There is no company_id field: the company is taken from the authenticated
+    operator's token. Accepting it from the body meant that knowing any
+    company's id was enough to attach a driver account -- and therefore a
+    valid login and a breakdown-reporting credential -- to that company.
+    """
+
     name: str = Field(..., min_length=2, max_length=128)
     email: EmailStr
-    password: str = Field(..., min_length=8)
+    password: str = Field(..., min_length=8, max_length=128)
     phone: Optional[str] = Field(None, max_length=32)
     assigned_truck_id: Optional[str] = None
 
@@ -65,8 +78,12 @@ def _token_response(driver: Driver) -> DriverTokenResponse:
 
 
 @router.post("/register", status_code=status.HTTP_201_CREATED, response_model=DriverTokenResponse)
-async def register_driver(req: DriverRegisterRequest, db: AsyncSession = Depends(get_db)):
-    company = await db.get(Company, req.company_id)
+async def register_driver(
+    req: DriverRegisterRequest,
+    principal: dict = Depends(get_current_company_principal),
+    db: AsyncSession = Depends(get_db),
+):
+    company = await db.get(Company, principal["company_id"])
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
     existing = await db.execute(select(Driver).where(Driver.email == req.email))

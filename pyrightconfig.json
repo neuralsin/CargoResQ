@@ -14,7 +14,9 @@
         "services/pricing_engine",
         "services/escrow_ledger",
         "services/realtime_gateway",
-        "services/orchestrator"
+        "services/orchestrator",
+        "services/sos",
+        "services/telemetry"
       ]
     }
   ]

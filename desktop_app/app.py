@@ -1,535 +1,1570 @@
-"""CargoResQ native operations console.
+"""
+CargoResQ operations console.
 
-The desktop product is a real CustomTkinter application. It connects directly
-to the configured API endpoint and can be packaged as a Windows executable
-with PyInstaller.
+The carrier owner's view of their own fleet and of any rescue in progress:
+where the trucks actually are, which incidents are open, what help has been
+offered and at what price, what the telemetry is saying, and which of their
+drivers has raised an alarm.
+
+Run with:
+    python -m desktop_app.app
 """
 from __future__ import annotations
 
 import threading
-import tkinter.messagebox as messagebox
-from datetime import datetime
-from typing import Any, Callable
+from tkinter import messagebox
+from typing import Any, Callable, Dict, List, Optional
 
 import customtkinter as ctk
 
-try:
-    from .api_client import ApiError, CargoResQClient
-except ImportError:  # PyInstaller executes the entry script outside the package.
-    from api_client import ApiError, CargoResQClient
+try:  # package import when run with -m, flat import under PyInstaller
+    from .api_client import ApiError, CargoResQClient, DEFAULT_API_URL
+    from .live_feed import LiveFeed
+    from .map_panel import MapPanel
+    from .theme import (
+        COLORS,
+        SIDEBAR_WIDTH,
+        minutes_label,
+        money,
+        relative_time,
+        severity_color,
+        state_color,
+        state_label,
+    )
+    from .widgets import (
+        EmptyState,
+        KeyValueGrid,
+        ListRow,
+        StatCard,
+        badge,
+        body,
+        card,
+        danger_button,
+        eyebrow,
+        heading,
+        primary_button,
+        scrollable,
+        secondary_button,
+    )
+except ImportError:  # pragma: no cover - frozen build
+    from api_client import ApiError, CargoResQClient, DEFAULT_API_URL
+    from live_feed import LiveFeed
+    from map_panel import MapPanel
+    from theme import (
+        COLORS,
+        SIDEBAR_WIDTH,
+        minutes_label,
+        money,
+        relative_time,
+        severity_color,
+        state_color,
+        state_label,
+    )
+    from widgets import (
+        EmptyState,
+        KeyValueGrid,
+        ListRow,
+        StatCard,
+        badge,
+        body,
+        card,
+        danger_button,
+        eyebrow,
+        heading,
+        primary_button,
+        scrollable,
+        secondary_button,
+    )
 
+REFRESH_INTERVAL_MS = 15_000
+EVENT_POLL_MS = 400
 
-COLORS = {
-    "ink": "#101615",
-    "muted": "#6F7B78",
-    "line": "#E4EAE7",
-    "canvas": "#F5F7F6",
-    "card": "#FFFFFF",
-    "teal": "#0F766E",
-    "teal_soft": "#E5F3F0",
-    "amber": "#B7791F",
-    "amber_soft": "#FFF4D8",
-    "red": "#B42318",
-    "red_soft": "#FDECEA",
-}
-
-
-def state_label(state: str) -> str:
-    return state.replace("_", " ").title()
-
-
-def state_color(state: str) -> tuple[str, str]:
-    if state in {"ESCROW_RELEASED", "DELIVERED"}:
-        return COLORS["teal"], COLORS["teal_soft"]
-    if state in {"CANCELLED", "DISPUTED"}:
-        return COLORS["red"], COLORS["red_soft"]
-    if state in {"BREAKDOWN_REPORTED", "TRIAGING", "MATCHING"}:
-        return COLORS["amber"], COLORS["amber_soft"]
-    return COLORS["teal"], COLORS["teal_soft"]
+TABS = [
+    ("Command centre", "Live map, open incidents, rescue offers"),
+    ("Rescue offers", "Offers made and received"),
+    ("Fleet", "Trucks and their current positions"),
+    ("Telemetry", "Derived alerts from the fleet"),
+    ("SOS", "Driver emergencies, own and nearby"),
+    ("Shipments", "Cargo in transit"),
+]
 
 
 class LoginView(ctk.CTkFrame):
-    def __init__(self, master: "CargoResQApp", on_login: Callable[[str, str, str], None]) -> None:
+    def __init__(self, master: "CargoResQApp") -> None:
         super().__init__(master, fg_color=COLORS["canvas"])
-        self.on_login = on_login
-        self.grid_columnconfigure(0, weight=1)
+        self.master_app = master
         self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
 
-        card = ctk.CTkFrame(self, fg_color=COLORS["card"], corner_radius=16, border_width=1, border_color=COLORS["line"])
-        card.grid(row=0, column=0, padx=32, pady=32)
-        card.grid_columnconfigure(0, weight=1)
+        panel = card(self, corner_radius=16)
+        panel.grid(row=0, column=0)
+        panel.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(card, text="CargoResQ", text_color=COLORS["ink"], font=ctk.CTkFont(size=30, weight="bold")).grid(row=0, column=0, padx=40, pady=(34, 2))
-        ctk.CTkLabel(card, text="LIVE OPERATIONS CONSOLE", text_color=COLORS["teal"], font=ctk.CTkFont(size=11, weight="bold")).grid(row=1, column=0, padx=40, pady=(0, 24))
+        heading(panel, "CargoResQ", size=30).grid(row=0, column=0, padx=44, pady=(36, 2))
+        ctk.CTkLabel(
+            panel,
+            text="OPERATIONS CONSOLE",
+            text_color=COLORS["teal"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+        ).grid(row=1, column=0, padx=44, pady=(0, 26))
 
-        ctk.CTkLabel(card, text="API Endpoint", anchor="w", text_color=COLORS["muted"]).grid(row=2, column=0, sticky="ew", padx=40, pady=(0, 4))
-        self.endpoint = ctk.CTkEntry(card, width=380, height=38, border_color=COLORS["line"], fg_color="#FAFCFB")
-        self.endpoint.insert(0, master.client.base_url)
-        self.endpoint.grid(row=3, column=0, padx=40, pady=(0, 14))
+        self.endpoint = self._field(panel, "API endpoint", 2, DEFAULT_API_URL)
+        self.email = self._field(panel, "Company email", 4, "")
+        self.password = self._field(panel, "Password", 6, "", show="•")
 
-        ctk.CTkLabel(card, text="Company Email", anchor="w", text_color=COLORS["muted"]).grid(row=4, column=0, sticky="ew", padx=40, pady=(0, 4))
-        self.email = ctk.CTkEntry(card, width=380, height=38, border_color=COLORS["line"], fg_color="#FAFCFB")
-        self.email.insert(0, "ops@cargoresq.com")
-        self.email.grid(row=5, column=0, padx=40, pady=(0, 14))
+        self.status = ctk.CTkLabel(
+            panel, text="", text_color=COLORS["red"], wraplength=380,
+            font=ctk.CTkFont(size=11),
+        )
+        self.status.grid(row=8, column=0, padx=44, pady=(8, 0))
 
-        ctk.CTkLabel(card, text="Password", anchor="w", text_color=COLORS["muted"]).grid(row=6, column=0, sticky="ew", padx=40, pady=(0, 4))
-        self.password = ctk.CTkEntry(card, width=380, height=38, show="•", border_color=COLORS["line"], fg_color="#FAFCFB")
-        self.password.insert(0, "Password123!")
-        self.password.grid(row=7, column=0, padx=40, pady=(0, 16))
+        self.button = primary_button(panel, "Sign in", self.submit, width=390, height=42)
+        self.button.grid(row=9, column=0, padx=44, pady=(18, 10))
 
-        self.status = ctk.CTkLabel(card, text="", text_color=COLORS["red"], wraplength=360)
-        self.status.grid(row=8, column=0, padx=40, pady=(0, 10))
+        ctk.CTkLabel(
+            panel,
+            text="Seed demo accounts with:  python scripts/seed_demo.py",
+            text_color=COLORS["muted"],
+            font=ctk.CTkFont(size=10),
+        ).grid(row=10, column=0, padx=44, pady=(0, 32))
 
-        self.button = ctk.CTkButton(card, text="Sign in to Operations", height=42, fg_color=COLORS["teal"], hover_color="#0A5C56", command=self.submit)
-        self.button.grid(row=9, column=0, padx=40, pady=(0, 10), sticky="ew")
+        self.email.bind("<Return>", lambda _e: self.submit())
+        self.password.bind("<Return>", lambda _e: self.submit())
 
-        demo_btn = ctk.CTkButton(card, text="One-Click Demo Login (Apex Pharma)", height=36, fg_color="#E9F2EF", text_color=COLORS["teal"], hover_color="#D8E8E4", command=self.quick_demo_login)
-        demo_btn.grid(row=10, column=0, padx=40, pady=(0, 32), sticky="ew")
-
-        self.password.bind("<Return>", lambda _event: self.submit())
-
-    def quick_demo_login(self) -> None:
-        self.email.delete(0, "end")
-        self.email.insert(0, "ops@cargoresq.com")
-        self.password.delete(0, "end")
-        self.password.insert(0, "Password123!")
-        self.submit()
+    def _field(self, master, label, row, initial, show=None):
+        ctk.CTkLabel(
+            master, text=label, anchor="w", text_color=COLORS["muted"],
+            font=ctk.CTkFont(size=11),
+        ).grid(row=row, column=0, sticky="ew", padx=44, pady=(0, 4))
+        entry = ctk.CTkEntry(
+            master, width=390, height=38, border_color=COLORS["line"],
+            fg_color="#FAFCFB", show=show or "",
+        )
+        entry.grid(row=row + 1, column=0, padx=44, pady=(0, 14))
+        if initial:
+            entry.insert(0, initial)
+        return entry
 
     def submit(self) -> None:
-        self.button.configure(state="disabled", text="Connecting…")
+        email = self.email.get().strip()
+        password = self.password.get()
+        if not email or not password:
+            self.status.configure(text="Enter your email and password.")
+            return
+
+        self.button.configure(state="disabled", text="Signing in...")
         self.status.configure(text="")
-        threading.Thread(target=self._submit_background, daemon=True).start()
 
-    def _submit_background(self) -> None:
-        try:
-            self.on_login(self.endpoint.get().strip(), self.email.get().strip(), self.password.get())
-        except ApiError as exc:
-            self.after(0, lambda: self._failed(str(exc)))
+        def work():
+            try:
+                self.master_app.connect(self.endpoint.get().strip(), email, password)
+                self.after(0, self.master_app.show_dashboard)
+            except ApiError as exc:
+                self.after(0, lambda: self.status.configure(text=str(exc)))
+            finally:
+                self.after(
+                    0, lambda: self.button.configure(state="normal", text="Sign in")
+                )
 
-    def _failed(self, message: str) -> None:
-        self.status.configure(text=message)
-        self.button.configure(state="normal", text="Sign in to Operations")
-
-
-class StatCard(ctk.CTkFrame):
-    def __init__(self, master: Any, title: str, value: str, detail: str, accent: str = COLORS["teal"]) -> None:
-        super().__init__(master, fg_color=COLORS["card"], corner_radius=12, border_width=1, border_color=COLORS["line"])
-        ctk.CTkLabel(self, text=title.upper(), text_color=COLORS["muted"], font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=16, pady=(14, 2))
-        ctk.CTkLabel(self, text=value, text_color=COLORS["ink"], font=ctk.CTkFont(size=26, weight="bold")).pack(anchor="w", padx=16)
-        ctk.CTkLabel(self, text=detail, text_color=accent, font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", padx=16, pady=(2, 14))
+        threading.Thread(target=work, daemon=True).start()
 
 
 class DashboardView(ctk.CTkFrame):
     def __init__(self, master: "CargoResQApp") -> None:
         super().__init__(master, fg_color=COLORS["canvas"])
         self.master_app = master
-        self.active_tab = "Command center"
-        self.incidents: list[dict[str, Any]] = []
-        self.trucks: list[dict[str, Any]] = []
-        self.shipments_data: list[dict[str, Any]] = []
-        self.selected_incident: dict[str, Any] | None = None
-        self.sidebar_buttons: dict[str, ctk.CTkButton] = {}
+        self.active_tab = "Command centre"
+
+        # Server state, refreshed on a timer and by live events.
+        self.incidents: List[Dict[str, Any]] = []
+        self.fleet: List[Dict[str, Any]] = []
+        self.shipments: List[Dict[str, Any]] = []
+        self.alerts: List[Dict[str, Any]] = []
+        self.own_sos: List[Dict[str, Any]] = []
+        self.nearby_sos: List[Dict[str, Any]] = []
+        self.inbox: List[Dict[str, Any]] = []
+        self.selected_incident_id: Optional[str] = None
+        self.selected_offers: List[Dict[str, Any]] = []
+
+        self.sidebar_buttons: Dict[str, ctk.CTkButton] = {}
+        self.feed: Optional[LiveFeed] = None
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
         self._build_sidebar()
-        self._build_main_container()
+        self._build_main()
+        self.start_live_feed()
         self.refresh()
+        self.after(EVENT_POLL_MS, self._poll_events)
+        self.after(REFRESH_INTERVAL_MS, self._auto_refresh)
 
+    # -- chrome ----------------------------------------------------------
     def _build_sidebar(self) -> None:
-        sidebar = ctk.CTkFrame(self, width=220, corner_radius=0, fg_color=COLORS["ink"])
+        sidebar = ctk.CTkFrame(
+            self, width=SIDEBAR_WIDTH, corner_radius=0, fg_color=COLORS["ink"]
+        )
         sidebar.grid(row=0, column=0, sticky="nsew")
         sidebar.grid_propagate(False)
 
-        ctk.CTkLabel(sidebar, text="CargoResQ", text_color="#FFFFFF", font=ctk.CTkFont(size=22, weight="bold")).pack(anchor="w", padx=22, pady=(28, 2))
-        ctk.CTkLabel(sidebar, text="RESCUE CONTROL", text_color="#8CCBC3", font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=22, pady=(0, 30))
+        ctk.CTkLabel(
+            sidebar, text="CargoResQ", text_color="#FFFFFF",
+            font=ctk.CTkFont(size=22, weight="bold"),
+        ).pack(anchor="w", padx=22, pady=(28, 2))
+        self.company_label = ctk.CTkLabel(
+            sidebar, text="", text_color=COLORS["sidebar_eyebrow"],
+            font=ctk.CTkFont(size=10, weight="bold"), wraplength=190, justify="left",
+        )
+        self.company_label.pack(anchor="w", padx=22, pady=(0, 26))
 
-        tabs = ["Command center", "Fleet", "Shipments", "Audit trail", "Dijkstra Route", "Porter Estimator"]
-        for label in tabs:
-            is_active = label == self.active_tab
-            btn = ctk.CTkButton(
-                sidebar,
-                text=label,
-                anchor="w",
-                height=38,
-                fg_color="#21423F" if is_active else "transparent",
-                hover_color="#21423F",
-                text_color="#EAF5F2" if is_active else "#B5C8C4",
+        for label, _hint in TABS:
+            button = ctk.CTkButton(
+                sidebar, text=label, anchor="w", height=38,
+                fg_color=COLORS["sidebar_active"] if label == self.active_tab else "transparent",
+                hover_color=COLORS["sidebar_active"],
+                text_color=(
+                    COLORS["sidebar_text_active"] if label == self.active_tab
+                    else COLORS["sidebar_text"]
+                ),
+                font=ctk.CTkFont(size=13),
                 command=lambda name=label: self.switch_tab(name),
             )
-            btn.pack(fill="x", padx=12, pady=2)
-            self.sidebar_buttons[label] = btn
+            button.pack(fill="x", padx=12, pady=2)
+            self.sidebar_buttons[label] = button
 
-        ctk.CTkLabel(sidebar, text="SIMULATION LAB", text_color="#7F9793", font=ctk.CTkFont(size=10, weight="bold")).pack(anchor="w", padx=22, pady=(26, 6))
-        self.scenario = ctk.CTkOptionMenu(sidebar, values=["cold_chain_critical", "competing_rescuers", "hazmat_no_match"], height=34, fg_color="#21423F", button_color=COLORS["teal"], button_hover_color="#0A5C56")
-        self.scenario.pack(fill="x", padx=12, pady=(0, 8))
-        ctk.CTkButton(sidebar, text="Run scenario", height=36, fg_color=COLORS["teal"], hover_color="#0A5C56", command=self.run_simulation).pack(fill="x", padx=12)
+        ctk.CTkLabel(
+            sidebar, text="", text_color=COLORS["sidebar_text"]
+        ).pack(expand=True)
 
-        ctk.CTkLabel(sidebar, text="", text_color="#B5C8C4").pack(expand=True)
-        ctk.CTkButton(sidebar, text="Sign out", anchor="w", height=38, fg_color="transparent", hover_color="#21423F", text_color="#B5C8C4", command=self.master_app.show_login).pack(fill="x", padx=12, pady=(0, 20))
+        self.feed_status = ctk.CTkLabel(
+            sidebar, text="● connecting", text_color=COLORS["sidebar_dim"],
+            font=ctk.CTkFont(size=10, weight="bold"),
+        )
+        self.feed_status.pack(anchor="w", padx=22, pady=(0, 8))
 
-    def _build_main_container(self) -> None:
-        self.main_area = ctk.CTkFrame(self, fg_color=COLORS["canvas"], corner_radius=0)
-        self.main_area.grid(row=0, column=1, sticky="nsew", padx=26, pady=24)
-        self.main_area.grid_columnconfigure(0, weight=1)
-        self.main_area.grid_rowconfigure(2, weight=1)
+        ctk.CTkButton(
+            sidebar, text="Sign out", anchor="w", height=38, fg_color="transparent",
+            hover_color=COLORS["sidebar_active"], text_color=COLORS["sidebar_text"],
+            font=ctk.CTkFont(size=12), command=self.master_app.sign_out,
+        ).pack(fill="x", padx=12, pady=(0, 18))
 
-        # Header Bar
-        header = ctk.CTkFrame(self.main_area, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 16))
+    def _build_main(self) -> None:
+        self.main = ctk.CTkFrame(self, fg_color=COLORS["canvas"], corner_radius=0)
+        self.main.grid(row=0, column=1, sticky="nsew", padx=26, pady=22)
+        self.main.grid_columnconfigure(0, weight=1)
+        self.main.grid_rowconfigure(2, weight=1)
+
+        header = ctk.CTkFrame(self.main, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 14))
         header.grid_columnconfigure(0, weight=1)
-        self.view_title = ctk.CTkLabel(header, text="Command center", text_color=COLORS["ink"], font=ctk.CTkFont(size=26, weight="bold"))
-        self.view_title.grid(row=0, column=0, sticky="w")
 
-        right = ctk.CTkFrame(header, fg_color="transparent")
-        right.grid(row=0, column=1, sticky="e")
-        self.connection = ctk.CTkLabel(right, text="● checking API", text_color=COLORS["muted"], font=ctk.CTkFont(size=11, weight="bold"))
-        self.connection.pack(side="left", padx=(0, 14))
-        ctk.CTkButton(right, text="Refresh", width=85, height=32, fg_color=COLORS["card"], hover_color="#E9EFEC", text_color=COLORS["ink"], border_width=1, border_color=COLORS["line"], command=self.refresh).pack(side="left")
+        titles = ctk.CTkFrame(header, fg_color="transparent")
+        titles.grid(row=0, column=0, sticky="w")
+        self.view_title = heading(titles, self.active_tab, size=26)
+        self.view_title.pack(anchor="w")
+        self.view_hint = body(titles, TABS[0][1], size=11)
+        self.view_hint.pack(anchor="w", pady=(2, 0))
 
-        # Stats Cards Bar
-        self.stats = ctk.CTkFrame(self.main_area, fg_color="transparent")
-        self.stats.grid(row=1, column=0, sticky="ew", pady=(0, 16))
+        controls = ctk.CTkFrame(header, fg_color="transparent")
+        controls.grid(row=0, column=1, sticky="e")
+        self.updated_label = body(controls, "", size=10)
+        self.updated_label.pack(side="left", padx=(0, 12))
+        secondary_button(controls, "Refresh", self.refresh, width=88).pack(side="left")
+
+        self.stats = ctk.CTkFrame(self.main, fg_color="transparent")
+        self.stats.grid(row=1, column=0, sticky="ew", pady=(0, 14))
         for i in range(4):
             self.stats.grid_columnconfigure(i, weight=1)
 
-        # Dynamic View Content Container
-        self.dynamic_content = ctk.CTkFrame(self.main_area, fg_color="transparent")
-        self.dynamic_content.grid(row=2, column=0, sticky="nsew")
-        self.dynamic_content.grid_columnconfigure(0, weight=1)
-        self.dynamic_content.grid_rowconfigure(0, weight=1)
+        self.content = ctk.CTkFrame(self.main, fg_color="transparent")
+        self.content.grid(row=2, column=0, sticky="nsew")
+        self.content.grid_columnconfigure(0, weight=1)
+        self.content.grid_rowconfigure(0, weight=1)
 
-    def switch_tab(self, tab_name: str) -> None:
-        self.active_tab = tab_name
-        self.view_title.configure(text=tab_name)
-        for name, btn in self.sidebar_buttons.items():
-            is_active = name == tab_name
-            btn.configure(
-                fg_color="#21423F" if is_active else "transparent",
-                text_color="#EAF5F2" if is_active else "#B5C8C4",
+    def switch_tab(self, name: str) -> None:
+        self.active_tab = name
+        self.view_title.configure(text=name)
+        self.view_hint.configure(text=dict(TABS).get(name, ""))
+        for label, button in self.sidebar_buttons.items():
+            active = label == name
+            button.configure(
+                fg_color=COLORS["sidebar_active"] if active else "transparent",
+                text_color=(
+                    COLORS["sidebar_text_active"] if active else COLORS["sidebar_text"]
+                ),
             )
-        self.render_active_view()
+        self.render()
 
-    def render_active_view(self) -> None:
-        for child in self.dynamic_content.winfo_children():
-            child.destroy()
-
-        if self.active_tab == "Command center":
-            self._render_command_center()
-        elif self.active_tab == "Fleet":
-            self._render_fleet_view()
-        elif self.active_tab == "Shipments":
-            self._render_shipments_view()
-        elif self.active_tab == "Audit trail":
-            self._render_audit_trail_view()
-        elif self.active_tab == "Dijkstra Route":
-            self._render_dijkstra_view()
-        elif self.active_tab == "Porter Estimator":
-            self._render_porter_view()
-
-    def _render_command_center(self) -> None:
-        content = ctk.CTkFrame(self.dynamic_content, fg_color="transparent")
-        content.pack(fill="both", expand=True)
-        content.grid_columnconfigure(0, weight=3)
-        content.grid_columnconfigure(1, weight=2)
-        content.grid_rowconfigure(0, weight=1)
-
-        # Left: Active Incidents
-        card_inc = ctk.CTkFrame(content, fg_color=COLORS["card"], corner_radius=12, border_width=1, border_color=COLORS["line"])
-        card_inc.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        card_inc.grid_rowconfigure(1, weight=1)
-        card_inc.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(card_inc, text="Active Incidents", text_color=COLORS["ink"], font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, sticky="w", padx=18, pady=(16, 2))
-        ctk.CTkLabel(card_inc, text="Every driver SOS triggers an atomic rescue lifecycle.", text_color=COLORS["muted"], font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky="w", padx=18, pady=(40, 0))
-        self.incident_list = ctk.CTkScrollableFrame(card_inc, fg_color="transparent")
-        self.incident_list.grid(row=1, column=0, sticky="nsew", padx=10, pady=12)
-
-        if not self.incidents:
-            ctk.CTkLabel(self.incident_list, text="No active incidents for this carrier.", text_color=COLORS["muted"]).pack(pady=28)
-        else:
-            for incident in self.incidents:
-                self._add_incident_row(incident)
-
-        # Right: Live Rescue Vector Map
-        card_map = ctk.CTkFrame(content, fg_color=COLORS["card"], corner_radius=12, border_width=1, border_color=COLORS["line"])
-        card_map.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-        card_map.grid_rowconfigure(1, weight=1)
-        card_map.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(card_map, text="Live Rescue Map", text_color=COLORS["ink"], font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, sticky="w", padx=18, pady=(16, 2))
-        ctk.CTkLabel(card_map, text="Carrier trucks and emergency distress waypoints", text_color=COLORS["muted"], font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky="w", padx=18, pady=(40, 0))
-        self.map_canvas = ctk.CTkCanvas(card_map, bg="#E9F0ED", highlightthickness=0)
-        self.map_canvas.grid(row=1, column=0, sticky="nsew", padx=14, pady=14)
-        self.map_canvas.bind("<Configure>", lambda _event: self.draw_map())
-        self.draw_map()
-
-    def _render_fleet_view(self) -> None:
-        card = ctk.CTkFrame(self.dynamic_content, fg_color=COLORS["card"], corner_radius=12, border_width=1, border_color=COLORS["line"])
-        card.pack(fill="both", expand=True)
-        ctk.CTkLabel(card, text="Registered Fleet Vehicles", text_color=COLORS["ink"], font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=22, pady=(18, 4))
-        ctk.CTkLabel(card, text="Carrier-owned refrigerated and ambient trucks registered in CargoResQ.", text_color=COLORS["muted"], font=ctk.CTkFont(size=12)).pack(anchor="w", padx=22, pady=(0, 14))
-
-        list_frame = ctk.CTkScrollableFrame(card, fg_color="transparent")
-        list_frame.pack(fill="both", expand=True, padx=16, pady=8)
-
-        if not self.trucks:
-            ctk.CTkLabel(list_frame, text="No trucks found for this carrier.", text_color=COLORS["muted"]).pack(pady=40)
-        else:
-            for truck in self.trucks:
-                row = ctk.CTkFrame(list_frame, fg_color="#FAFCFB", corner_radius=10, border_width=1, border_color=COLORS["line"])
-                row.pack(fill="x", pady=5, padx=4)
-                left = ctk.CTkFrame(row, fg_color="transparent")
-                left.pack(side="left", padx=16, pady=12)
-                ctk.CTkLabel(left, text=truck.get("registration_number", "TRK-000"), font=ctk.CTkFont(size=14, weight="bold"), text_color=COLORS["ink"]).pack(anchor="w")
-                detail = f"GPS: {truck.get('latitude', 0.0):.4f}, {truck.get('longitude', 0.0):.4f}  ·  Max: {truck.get('max_weight_kg', 0)} kg  ·  Vol: {truck.get('max_volume_m3', 0)} m³"
-                ctk.CTkLabel(left, text=detail, font=ctk.CTkFont(size=11), text_color=COLORS["muted"]).pack(anchor="w", pady=(2, 0))
-
-                right = ctk.CTkFrame(row, fg_color="transparent")
-                right.pack(side="right", padx=16)
-                is_reefer = truck.get("refrigerated", False)
-                reefer_text = f"Reefer ({truck.get('min_temp_c', 0)}°C)" if is_reefer else "Ambient"
-                ctk.CTkLabel(right, text=reefer_text, font=ctk.CTkFont(size=11, weight="bold"), text_color=COLORS["teal"] if is_reefer else COLORS["muted"]).pack(side="left", padx=8)
-                status = truck.get("status", "idle")
-                ctk.CTkLabel(right, text=status.upper(), fg_color=COLORS["teal_soft"] if status == "idle" else COLORS["amber_soft"], text_color=COLORS["teal"] if status == "idle" else COLORS["amber"], corner_radius=6, font=ctk.CTkFont(size=10, weight="bold"), padx=8, pady=4).pack(side="left")
-
-    def _render_shipments_view(self) -> None:
-        card = ctk.CTkFrame(self.dynamic_content, fg_color=COLORS["card"], corner_radius=12, border_width=1, border_color=COLORS["line"])
-        card.pack(fill="both", expand=True)
-        ctk.CTkLabel(card, text="Active Shipments & Waybills", text_color=COLORS["ink"], font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=22, pady=(18, 4))
-        ctk.CTkLabel(card, text="Cold-chain pharmaceutical consignments currently in transit or queued.", text_color=COLORS["muted"], font=ctk.CTkFont(size=12)).pack(anchor="w", padx=22, pady=(0, 14))
-
-        list_frame = ctk.CTkScrollableFrame(card, fg_color="transparent")
-        list_frame.pack(fill="both", expand=True, padx=16, pady=8)
-
-        if not self.shipments_data:
-            ctk.CTkLabel(list_frame, text="No shipments active. Run a simulation scenario or create a shipment.", text_color=COLORS["muted"]).pack(pady=40)
-        else:
-            for ship in self.shipments_data:
-                row = ctk.CTkFrame(list_frame, fg_color="#FAFCFB", corner_radius=10, border_width=1, border_color=COLORS["line"])
-                row.pack(fill="x", pady=5, padx=4)
-                left = ctk.CTkFrame(row, fg_color="transparent")
-                left.pack(side="left", padx=16, pady=12)
-                ctk.CTkLabel(left, text=ship.get("cargo_type", "Consignment"), font=ctk.CTkFont(size=14, weight="bold"), text_color=COLORS["ink"]).pack(anchor="w")
-                detail = f"ID: {ship.get('id', '—')}  ·  Weight: {ship.get('weight_kg', 0)} kg  ·  Value: ₹{ship.get('value_inr', 0):,}"
-                ctk.CTkLabel(left, text=detail, font=ctk.CTkFont(size=11), text_color=COLORS["muted"]).pack(anchor="w", pady=(2, 0))
-
-                right = ctk.CTkFrame(row, fg_color="transparent")
-                right.pack(side="right", padx=16)
-                status = ship.get("status", "in_transit")
-                ctk.CTkLabel(right, text=status.replace("_", " ").upper(), fg_color=COLORS["teal_soft"], text_color=COLORS["teal"], corner_radius=6, font=ctk.CTkFont(size=10, weight="bold"), padx=8, pady=4).pack(side="left")
-
-    def _render_audit_trail_view(self) -> None:
-        card = ctk.CTkFrame(self.dynamic_content, fg_color=COLORS["card"], corner_radius=12, border_width=1, border_color=COLORS["line"])
-        card.pack(fill="both", expand=True)
-        ctk.CTkLabel(card, text="Immutable Incident Audit Trail", text_color=COLORS["ink"], font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=22, pady=(18, 4))
-        ctk.CTkLabel(card, text="Phase 17 canonical append-only audit trail verifying state machine transitions.", text_color=COLORS["muted"], font=ctk.CTkFont(size=12)).pack(anchor="w", padx=22, pady=(0, 14))
-
-        list_frame = ctk.CTkScrollableFrame(card, fg_color="transparent")
-        list_frame.pack(fill="both", expand=True, padx=16, pady=8)
-
-        if not self.incidents:
-            ctk.CTkLabel(list_frame, text="No incident history recorded yet.", text_color=COLORS["muted"]).pack(pady=40)
-        else:
-            for inc in self.incidents:
-                row = ctk.CTkFrame(list_frame, fg_color="#FAFCFB", corner_radius=10, border_width=1, border_color=COLORS["line"])
-                row.pack(fill="x", pady=6, padx=4)
-                top = ctk.CTkFrame(row, fg_color="transparent")
-                top.pack(fill="x", padx=16, pady=(12, 6))
-                ctk.CTkLabel(top, text=f"Incident {inc.get('id', '—')}  ·  {inc.get('cargoType', 'Cargo')}", font=ctk.CTkFont(size=13, weight="bold"), text_color=COLORS["ink"]).pack(side="left")
-                st = inc.get("state", "UNKNOWN")
-                fg, bg = state_color(st)
-                ctk.CTkLabel(top, text=state_label(st), fg_color=bg, text_color=fg, corner_radius=6, font=ctk.CTkFont(size=10, weight="bold"), padx=8, pady=2).pack(side="right")
-
-                ctk.CTkLabel(row, text=f"Created: {inc.get('createdAt', '—')}  ·  Minutes to Spoilage: {inc.get('minutesUntilSpoilage', '—')} min", font=ctk.CTkFont(size=11), text_color=COLORS["muted"]).pack(anchor="w", padx=16, pady=(0, 12))
-
-    def _render_dijkstra_view(self) -> None:
-        card = ctk.CTkFrame(self.dynamic_content, fg_color=COLORS["card"], corner_radius=12, border_width=1, border_color=COLORS["line"])
-        card.pack(fill="both", expand=True, padx=8, pady=4)
-        ctk.CTkLabel(card, text="Dijkstra's Congestion-Aware Route Optimizer", text_color=COLORS["ink"], font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=22, pady=(18, 4))
-        ctk.CTkLabel(card, text="Solves the fastest rescue corridor factoring in dynamic road network congestion.", text_color=COLORS["muted"], font=ctk.CTkFont(size=12)).pack(anchor="w", padx=22, pady=(0, 14))
-
-        controls = ctk.CTkFrame(card, fg_color="transparent")
-        controls.pack(fill="x", padx=22, pady=10)
-
-        ctk.CTkLabel(controls, text="Origin Hub:", font=ctk.CTkFont(size=12, weight="bold")).pack(side="left", padx=(0, 8))
-        self.dijkstra_start = ctk.CTkOptionMenu(controls, values=["node_1 (Spear St)", "node_2 (Market St)", "node_3 (Mission Arterial)"], width=180)
-        self.dijkstra_start.pack(side="left", padx=(0, 20))
-
-        ctk.CTkLabel(controls, text="Drop-off Terminal:", font=ctk.CTkFont(size=12, weight="bold")).pack(side="left", padx=(0, 8))
-        self.dijkstra_end = ctk.CTkOptionMenu(controls, values=["node_7 (Central General Dock 4)", "node_6 (Trauma Vault)", "node_5 (South Basin)"], width=220)
-        self.dijkstra_end.pack(side="left", padx=(0, 20))
-
-        ctk.CTkButton(controls, text="Calculate Fastest Path", fg_color=COLORS["teal"], hover_color="#0A5C56", command=self.compute_dijkstra).pack(side="left")
-
-        self.dijkstra_result = ctk.CTkLabel(card, text="Click 'Calculate Fastest Path' to run Dijkstra's algorithm.", font=ctk.CTkFont(size=13), text_color=COLORS["muted"])
-        self.dijkstra_result.pack(anchor="w", padx=22, pady=20)
-
-    def compute_dijkstra(self) -> None:
-        start = self.dijkstra_start.get().split()[0]
-        end = self.dijkstra_end.get().split()[0]
-        try:
-            res = self.master_app.client.dijkstra_fastest_route(start, end)
-            msg = f"Fastest Travel Time: {res.get('total_travel_time_minutes')} min  ·  Distance: {res.get('total_distance_km')} km\nPath: {' → '.join(res.get('path', []))}"
-            self.dijkstra_result.configure(text=msg, text_color=COLORS["teal"])
-        except ApiError as exc:
-            self.dijkstra_result.configure(text=str(exc), text_color=COLORS["red"])
-
-    def _render_porter_view(self) -> None:
-        card = ctk.CTkFrame(self.dynamic_content, fg_color=COLORS["card"], corner_radius=12, border_width=1, border_color=COLORS["line"])
-        card.pack(fill="both", expand=True, padx=8, pady=4)
-        ctk.CTkLabel(card, text="Porter-Style Logistics Fare Estimator", text_color=COLORS["ink"], font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w", padx=22, pady=(18, 4))
-        ctk.CTkLabel(card, text="Transparent on-demand pricing across Tata Ace, Bolero, and Cold-Chain Reefer fleet.", text_color=COLORS["muted"], font=ctk.CTkFont(size=12)).pack(anchor="w", padx=22, pady=(0, 14))
-
-        form = ctk.CTkFrame(card, fg_color="transparent")
-        form.pack(fill="x", padx=22, pady=10)
-
-        ctk.CTkLabel(form, text="Vehicle Category:", font=ctk.CTkFont(size=12, weight="bold")).pack(side="left", padx=(0, 8))
-        self.porter_vehicle = ctk.CTkOptionMenu(form, values=["tata_ultra_reefer", "tata_ace", "bolero_maxi", "tata_407", "eicher_pharma_reefer"], width=200)
-        self.porter_vehicle.pack(side="left", padx=(0, 20))
-
-        ctk.CTkLabel(form, text="Distance (km):", font=ctk.CTkFont(size=12, weight="bold")).pack(side="left", padx=(0, 8))
-        self.porter_dist = ctk.CTkEntry(form, width=80)
-        self.porter_dist.insert(0, "25.0")
-        self.porter_dist.pack(side="left", padx=(0, 20))
-
-        ctk.CTkButton(form, text="Estimate Fare", fg_color=COLORS["teal"], hover_color="#0A5C56", command=self.compute_porter_fare).pack(side="left")
-
-        self.porter_result = ctk.CTkLabel(card, text="Enter rescue parameters and click 'Estimate Fare'.", font=ctk.CTkFont(size=13), text_color=COLORS["muted"])
-        self.porter_result.pack(anchor="w", padx=22, pady=20)
-
-    def compute_porter_fare(self) -> None:
-        v_type = self.porter_vehicle.get()
-        try:
-            dist = float(self.porter_dist.get())
-            res = self.master_app.client.estimate_fare(v_type, dist, requires_loading_help=True, is_urgent_rescue=True)
-            msg = f"Vehicle: {res.get('vehicleName')}  ·  Base Fare: ₹{res.get('baseFare')}  ·  Distance Charge: ₹{res.get('distanceCharge')}  ·  Telemetry: ₹{res.get('telemetryFee')}\nTOTAL ESTIMATED ESCROW FARE: ₹{res.get('estimatedTotalInr'):,}"
-            self.porter_result.configure(text=msg, text_color=COLORS["teal"])
-        except Exception as exc:
-            self.porter_result.configure(text=str(exc), text_color=COLORS["red"])
-
+    # -- data ------------------------------------------------------------
     def refresh(self) -> None:
-        threading.Thread(target=self._refresh_background, daemon=True).start()
+        threading.Thread(target=self._fetch, daemon=True).start()
 
-    def _refresh_background(self) -> None:
-        try:
-            health = self.master_app.client.health()
-            incidents = self.master_app.client.incidents()
-            trucks = self.master_app.client.trucks()
-            shipments = self.master_app.client.shipments()
-            self.after(0, lambda: self._render_data(health, incidents, trucks, shipments))
-        except ApiError as exc:
-            self.after(0, lambda: self.connection.configure(text="● API unavailable", text_color=COLORS["red"]))
-            self.after(0, lambda: self.master_app.set_status(str(exc)))
+    def _auto_refresh(self) -> None:
+        self.refresh()
+        self.after(REFRESH_INTERVAL_MS, self._auto_refresh)
 
-    def _render_data(self, health: dict[str, Any], incidents: list[dict[str, Any]], trucks: list[dict[str, Any]], shipments: list[dict[str, Any]]) -> None:
-        self.incidents = incidents
-        self.trucks = trucks
-        self.shipments_data = shipments
-        self.connection.configure(text="● live API", text_color=COLORS["teal"])
+    def _fetch(self) -> None:
+        client = self.master_app.client
+        payload: Dict[str, Any] = {}
+        errors: List[str] = []
 
+        # Each call is independent: one failing endpoint should not blank the
+        # whole console.
+        for key, call in [
+            ("incidents", client.incidents),
+            ("fleet", client.fleet_live),
+            ("shipments", client.shipments),
+            ("alerts", lambda: client.alerts("OPEN")),
+            ("own_sos", client.active_sos),
+            ("nearby_sos", client.nearby_sos),
+            ("inbox", client.offer_inbox),
+        ]:
+            try:
+                payload[key] = call()
+            except ApiError as exc:
+                payload[key] = []
+                errors.append(f"{key}: {exc}")
+
+        self._safe_after(lambda: self._apply(payload, errors))
+
+    def _apply(self, payload: Dict[str, Any], errors: List[str]) -> None:
+        self.incidents = payload.get("incidents", [])
+        self.fleet = payload.get("fleet", [])
+        self.shipments = payload.get("shipments", [])
+        self.alerts = payload.get("alerts", [])
+        self.own_sos = payload.get("own_sos", [])
+        self.nearby_sos = payload.get("nearby_sos", [])
+        self.inbox = payload.get("inbox", [])
+
+        from datetime import datetime
+
+        self.updated_label.configure(
+            text=f"Updated {datetime.now().strftime('%H:%M:%S')}"
+        )
+        if errors:
+            self.master_app.set_status(errors[0])
+        self._render_stats()
+        self.render()
+
+    def _render_stats(self) -> None:
         for child in self.stats.winfo_children():
             child.destroy()
-        active = [i for i in incidents if i.get("state") not in {"ESCROW_RELEASED", "CANCELLED", "DISPUTED"}]
-        released = len([i for i in incidents if i.get("state") == "ESCROW_RELEASED"])
-        values = [
-            ("Active rescues", str(len(active)), "requires attention"),
-            ("Fleet online", str(len(trucks)), "registered trucks"),
-            ("Resolved", str(released), "escrow released"),
-            ("WebSockets", str(health.get("active_websockets", 0)), "live connections"),
+
+        terminal = {"ESCROW_RELEASED", "CANCELLED", "DISPUTED"}
+        open_incidents = [i for i in self.incidents if i.get("state") not in terminal]
+        critical = [a for a in self.alerts if a.get("severity") == "CRITICAL"]
+        live_trucks = [t for t in self.fleet if t.get("positionIsLive")]
+
+        cards = [
+            (
+                "Open incidents",
+                str(len(open_incidents)),
+                "needing a rescue" if open_incidents else "all clear",
+                COLORS["red"] if open_incidents else None,
+            ),
+            (
+                "Fleet reporting",
+                f"{len(live_trucks)}/{len(self.fleet)}",
+                "sending live positions",
+                None if live_trucks == self.fleet else COLORS["amber"],
+            ),
+            (
+                "Open alerts",
+                str(len(self.alerts)),
+                f"{len(critical)} critical" if critical else "nothing urgent",
+                COLORS["red"] if critical else None,
+            ),
+            (
+                "Active SOS",
+                str(len(self.own_sos)),
+                f"+{len(self.nearby_sos)} nearby on network",
+                COLORS["red"] if self.own_sos else None,
+            ),
         ]
-        for idx, (title, value, detail) in enumerate(values):
-            StatCard(self.stats, title, value, detail).grid(row=0, column=idx, sticky="ew", padx=(0 if idx == 0 else 6, 0 if idx == 3 else 6))
+        for index, (title, value, detail, accent) in enumerate(cards):
+            StatCard(self.stats, title, value, detail, accent).grid(
+                row=0, column=index, sticky="ew",
+                padx=(0 if index == 0 else 6, 0 if index == 3 else 6),
+            )
 
-        self.render_active_view()
+    # -- rendering -------------------------------------------------------
+    def render(self) -> None:
+        for child in self.content.winfo_children():
+            child.destroy()
+        renderer: Callable[[], None] = {
+            "Command centre": self._render_command_centre,
+            "Rescue offers": self._render_offers,
+            "Fleet": self._render_fleet,
+            "Telemetry": self._render_telemetry,
+            "SOS": self._render_sos,
+            "Shipments": self._render_shipments,
+        }.get(self.active_tab, self._render_command_centre)
+        renderer()
 
-    def _add_incident_row(self, incident: dict[str, Any]) -> None:
-        state = incident.get("state", "UNKNOWN")
-        fg, bg = state_color(state)
-        row = ctk.CTkFrame(self.incident_list, fg_color="#FBFCFB", corner_radius=10, border_width=1, border_color=COLORS["line"])
-        row.pack(fill="x", padx=2, pady=5)
-        row.bind("<Button-1>", lambda _event, item=incident: self.select_incident(item))
-        left = ctk.CTkFrame(row, fg_color="transparent")
-        left.pack(side="left", fill="x", expand=True, padx=12, pady=11)
-        ctk.CTkLabel(left, text=incident.get("cargoType", "Cargo rescue"), text_color=COLORS["ink"], font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w")
-        ctk.CTkLabel(left, text=f"{incident.get('id', '—')}  ·  shipment {incident.get('shipmentId', '—')}", text_color=COLORS["muted"], font=ctk.CTkFont(size=10)).pack(anchor="w", pady=(2, 0))
-        ctk.CTkLabel(row, text=state_label(state), text_color=fg, fg_color=bg, corner_radius=8, font=ctk.CTkFont(size=10, weight="bold")).pack(side="right", padx=12, pady=13)
+    # ---- command centre ----
+    def _render_command_centre(self) -> None:
+        wrap = ctk.CTkFrame(self.content, fg_color="transparent")
+        wrap.grid(row=0, column=0, sticky="nsew")
+        wrap.grid_columnconfigure(0, weight=2, uniform="cc")
+        wrap.grid_columnconfigure(1, weight=3, uniform="cc")
+        wrap.grid_rowconfigure(0, weight=1)
 
-    def select_incident(self, incident: dict[str, Any]) -> None:
-        self.selected_incident = incident
-        timeline = "Loading audit trail…"
-        try:
-            events = self.master_app.client.incident_timeline(incident["id"])
-            timeline = "\n".join(f"{state_label(e.get('newState') or e.get('type', 'event'))}  {e.get('createdAt', '')[:19]}" for e in events)
-        except ApiError as exc:
-            timeline = str(exc)
-        messagebox.showinfo("Incident audit trail", f"{incident.get('cargoType', 'Cargo rescue')}\n\nState: {state_label(incident.get('state', 'UNKNOWN'))}\n\n{timeline}")
+        left = card(wrap)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        left.grid_rowconfigure(1, weight=1)
+        left.grid_columnconfigure(0, weight=1)
 
-    def draw_map(self) -> None:
-        if not hasattr(self, "map_canvas") or not self.map_canvas.winfo_exists():
+        header = ctk.CTkFrame(left, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 6))
+        header.grid_columnconfigure(0, weight=1)
+        heading(header, "Incidents").grid(row=0, column=0, sticky="w")
+        secondary_button(
+            header, "Report breakdown", self._open_report_breakdown, width=140
+        ).grid(row=0, column=1, sticky="e")
+
+        listing = scrollable(left)
+        listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(4, 14))
+
+        if not self.incidents:
+            EmptyState(
+                listing,
+                "No incidents",
+                "Nothing has broken down. Incidents appear here the moment a "
+                "driver reports a breakdown from the app.",
+            ).pack(fill="x")
+        else:
+            for incident in self.incidents:
+                state = incident.get("state", "")
+                ListRow(
+                    listing,
+                    incident.get("cargoType") or "Cargo rescue",
+                    f"{incident.get('id')}  |  {state_label(state)}"
+                    + (
+                        f"  |  {minutes_label(incident.get('minutesUntilSpoilage'))} left"
+                        if incident.get("minutesUntilSpoilage") is not None
+                        else ""
+                    ),
+                    state_label(state),
+                    state_color(state),
+                    on_click=lambda i=incident: self.select_incident(i["id"]),
+                    selected=incident["id"] == self.selected_incident_id,
+                ).pack(fill="x", pady=4, padx=2)
+
+        right = ctk.CTkFrame(wrap, fg_color="transparent")
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(0, weight=3)
+        right.grid_rowconfigure(1, weight=2)
+
+        self.map_panel = MapPanel(right, height=320)
+        self.map_panel.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
+        self._draw_map()
+
+        self.detail_card = card(right)
+        self.detail_card.grid(row=1, column=0, sticky="nsew")
+        self._render_incident_detail()
+
+    def _draw_map(self) -> None:
+        if not hasattr(self, "map_panel"):
             return
-        canvas = self.map_canvas
-        canvas.delete("all")
-        width, height = max(canvas.winfo_width(), 300), max(canvas.winfo_height(), 260)
-        for x in range(0, width, 42):
-            canvas.create_line(x, 0, x, height, fill="#D7E2DE")
-        for y in range(0, height, 42):
-            canvas.create_line(0, y, width, y, fill="#D7E2DE")
-        canvas.create_line(0, height * .72, width, height * .22, fill="#A9C8C0", width=4)
-        for i, incident in enumerate(self.incidents[:8]):
-            x = 48 + (i * 71) % max(width - 90, 1)
-            y = 62 + (i * 47) % max(height - 110, 1)
-            canvas.create_oval(x - 7, y - 7, x + 7, y + 7, fill=COLORS["red"], outline="#FFFFFF", width=2)
-            canvas.create_text(x + 12, y - 12, text=f"INC {i + 1}", anchor="w", fill=COLORS["ink"], font=("Segoe UI", 9, "bold"))
-        for i, truck in enumerate(self.trucks[:10]):
-            x = 70 + (i * 97) % max(width - 120, 1)
-            y = 150 + (i * 61) % max(height - 180, 1)
-            canvas.create_rectangle(x - 6, y - 6, x + 6, y + 6, fill=COLORS["teal"], outline="#FFFFFF", width=2)
-        canvas.create_text(16, height - 18, text="Vector operations view  ·  live coordinates from API", anchor="w", fill=COLORS["muted"], font=("Segoe UI", 9))
+        panel = self.map_panel
+        panel.clear()
+        positions = []
 
-    def run_simulation(self) -> None:
+        for truck in self.fleet:
+            lat, lng = truck.get("latitude"), truck.get("longitude")
+            if lat is None or lng is None:
+                continue
+            live = truck.get("positionIsLive")
+            panel.add_marker(
+                f"truck:{truck['truckId']}",
+                lat, lng,
+                truck.get("registrationNumber", truck["truckId"]),
+                kind="own_truck" if live else "candidate",
+                detail=f"{truck.get('status')} | {relative_time(truck.get('lastSeenAt'))}",
+            )
+            positions.append((lat, lng))
+
+        for incident in self.incidents:
+            if incident.get("state") in {"ESCROW_RELEASED", "CANCELLED"}:
+                continue
+            lat, lng = incident.get("lat"), incident.get("lng")
+            if lat is None or lng is None:
+                continue
+            panel.add_marker(
+                f"incident:{incident['id']}",
+                lat, lng,
+                incident.get("cargoType") or "Incident",
+                kind="incident",
+            )
+            positions.append((lat, lng))
+
+        for alert in self.own_sos:
+            alat = alert.get("latitude")
+            alng = alert.get("longitude")
+            if alat is None or alng is None:
+                continue
+            panel.add_marker(
+                f"sos:{alert['id']}",
+                alat, alng,
+                f"SOS {alert.get('category')}",
+                kind="sos",
+            )
+            positions.append((alat, alng))
+
+        panel.fit_to_markers(positions)
+        stale = len([t for t in self.fleet if not t.get("positionIsLive")])
+        panel.set_status(
+            f"{len(positions)} positions  |  {stale} truck(s) not reporting"
+            if positions
+            else "No positions yet -- trucks appear once the driver app sends telemetry"
+        )
+
+    def _render_incident_detail(self) -> None:
+        for child in self.detail_card.winfo_children():
+            child.destroy()
+
+        if not self.selected_incident_id:
+            EmptyState(
+                self.detail_card,
+                "Select an incident",
+                "Pick an incident to see its rescue offers, price and audit trail.",
+            ).pack(fill="both", expand=True)
+            return
+
+        incident = next(
+            (i for i in self.incidents if i["id"] == self.selected_incident_id), None
+        )
+        if incident is None:
+            EmptyState(self.detail_card, "Incident no longer listed").pack(fill="both", expand=True)
+            return
+
+        container = scrollable(self.detail_card)
+        container.pack(fill="both", expand=True, padx=14, pady=14)
+
+        top = ctk.CTkFrame(container, fg_color="transparent")
+        top.pack(fill="x")
+        heading(top, incident.get("cargoType") or "Cargo rescue").pack(side="left")
+        fg, bg = state_color(incident.get("state", ""))
+        badge(top, state_label(incident.get("state", "")), fg, bg).pack(side="right")
+
+        KeyValueGrid(
+            container,
+            [
+                ("Incident", incident.get("id", "--")),
+                ("Shipment", incident.get("shipmentId", "--")),
+                ("Position", f"{incident.get('lat'):.4f}, {incident.get('lng'):.4f}"),
+                (
+                    "Time to spoilage",
+                    minutes_label(incident.get("minutesUntilSpoilage")),
+                ),
+                ("Assigned truck", incident.get("assignedTruckId") or "none yet"),
+            ],
+        ).pack(fill="x", pady=(12, 14))
+
+        actions = ctk.CTkFrame(container, fg_color="transparent")
+        actions.pack(fill="x", pady=(0, 12))
+        state = incident.get("state")
+
+        if state in {"BREAKDOWN_REPORTED", "TRIAGING"}:
+            primary_button(
+                actions, "Find rescuers", lambda: self._find_rescuers(incident)
+            ).pack(side="left", padx=(0, 8))
+        elif state == "MATCHING":
+            primary_button(
+                actions, "Send offers", lambda: self._send_offers(incident)
+            ).pack(side="left", padx=(0, 8))
+        secondary_button(
+            actions, "Audit trail", lambda: self._show_timeline(incident["id"]), width=110
+        ).pack(side="left")
+
+        eyebrow(container, "Rescue offers").pack(anchor="w", pady=(6, 6))
+        if not self.selected_offers:
+            body(
+                container,
+                "No offers yet. Use 'Send offers' to ask compatible carriers nearby.",
+                size=11,
+            ).pack(anchor="w")
+        for offer in self.selected_offers:
+            self._render_offer_card(container, offer)
+
+    def _render_offer_card(self, master: Any, offer: Dict[str, Any]) -> None:
+        holder = card(master, fg_color=COLORS["row"])
+        holder.pack(fill="x", pady=5)
+
+        row = ctk.CTkFrame(holder, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=(12, 4))
+        heading(row, money(offer.get("priceTotalInr")), size=15).pack(side="left")
+        fg, bg = state_color(offer.get("state", ""))
+        badge(row, state_label(offer.get("state", "")), fg, bg).pack(side="right")
+
+        meta = (
+            f"ETA {minutes_label(offer.get('etaMinutes'))}  |  "
+            f"{offer.get('distanceKm', 0):.1f} km  |  "
+            f"score {offer.get('rescueScore', 0):.0f}"
+        )
+        body(holder, meta, size=11).pack(anchor="w", padx=14)
+
+        # The carrier's reputation, shown at the moment of the decision --
+        # this is who the owner is about to trust with their cargo.
+        reputation = offer.get("carrierReputation") or {}
+        if reputation:
+            if reputation.get("isNewCounterparty"):
+                rep_text = "New to the network -- no completed rescues yet"
+                rep_color = COLORS["amber"]
+            else:
+                stars = reputation.get("averageStars")
+                rep_text = (
+                    f"Trust {reputation.get('trustScore')}  |  "
+                    f"{reputation.get('rescuesCompleted')} rescues"
+                    + (f"  |  {stars:.1f}/5 from {reputation.get('ratingCount')}" if stars else "")
+                )
+                rep_color = COLORS["teal"] if reputation.get("trustScore", 0) >= 80 else COLORS["amber"]
+            body(holder, rep_text, size=11, color=rep_color).pack(anchor="w", padx=14, pady=(4, 0))
+
+            for signal in (reputation.get("signals") or [])[:3]:
+                mark = {"positive": "+", "negative": "!", "neutral": "-"}.get(
+                    signal.get("kind"), "-"
+                )
+                body(holder, f"  {mark} {signal.get('label')}", size=10).pack(
+                    anchor="w", padx=14
+                )
+
+        for reason in (offer.get("scoreReasons") or [])[:3]:
+            body(holder, f"  • {reason}", size=10).pack(anchor="w", padx=14)
+
+        buttons = ctk.CTkFrame(holder, fg_color="transparent")
+        buttons.pack(fill="x", padx=14, pady=(10, 12))
+
+        if offer.get("state") in {"PENDING", "CARRIER_ACCEPTED"}:
+            label = (
+                "Confirm rescue" if offer.get("carrierAccepted") else "Pre-confirm"
+            )
+            primary_button(
+                buttons, label, lambda o=offer: self._confirm_offer(o), height=34
+            ).pack(side="left", padx=(0, 8))
+            secondary_button(
+                buttons, "Withdraw", lambda o=offer: self._withdraw_offer(o), width=96
+            ).pack(side="left")
+        elif offer.get("state") == "BOUND":
+            body(
+                buttons,
+                f"Bound. Escrow {offer.get('escrowId')} holding "
+                f"{money(offer.get('priceTotalInr'))}.",
+                size=11,
+                color=COLORS["teal"],
+            ).pack(side="left")
+            secondary_button(
+                buttons, "Escrow", lambda o=offer: self._show_escrow(o), width=90
+            ).pack(side="right")
+
+    # ---- offers tab ----
+    def _render_offers(self) -> None:
+        wrap = ctk.CTkFrame(self.content, fg_color="transparent")
+        wrap.grid(row=0, column=0, sticky="nsew")
+        wrap.grid_columnconfigure(0, weight=1, uniform="o")
+        wrap.grid_columnconfigure(1, weight=1, uniform="o")
+        wrap.grid_rowconfigure(0, weight=1)
+
+        inbox = card(wrap)
+        inbox.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        inbox.grid_rowconfigure(1, weight=1)
+        inbox.grid_columnconfigure(0, weight=1)
+        heading(inbox, "Offers to us").grid(row=0, column=0, sticky="w", padx=18, pady=(16, 2))
+        body(
+            inbox,
+            "Rescues other carriers have asked us to perform. Accepting shows "
+            "what we would earn; the customer's own price is theirs.",
+            size=11,
+        ).grid(row=0, column=0, sticky="w", padx=18, pady=(34, 0))
+
+        listing = scrollable(inbox)
+        listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(12, 14))
+
+        live = [o for o in self.inbox if o.get("state") in {"PENDING", "OWNER_CONFIRMED"}]
+        if not live:
+            EmptyState(
+                listing,
+                "No open requests",
+                "When a nearby carrier's truck breaks down and one of ours fits "
+                "the cargo, the request appears here.",
+            ).pack(fill="x")
+        for offer in live:
+            holder = card(listing, fg_color=COLORS["row"])
+            holder.pack(fill="x", pady=5)
+            row = ctk.CTkFrame(holder, fg_color="transparent")
+            row.pack(fill="x", padx=14, pady=(12, 2))
+            heading(row, f"Earn {money(offer.get('payoutInr'))}", size=15).pack(side="left")
+            fg, bg = state_color(offer.get("state", ""))
+            badge(row, state_label(offer.get("state", "")), fg, bg).pack(side="right")
+            body(
+                holder,
+                f"ETA {minutes_label(offer.get('etaMinutes'))}  |  "
+                f"{offer.get('distanceKm', 0):.1f} km away",
+                size=11,
+            ).pack(anchor="w", padx=14, pady=(2, 0))
+
+            buttons = ctk.CTkFrame(holder, fg_color="transparent")
+            buttons.pack(fill="x", padx=14, pady=(10, 12))
+            primary_button(
+                buttons, "Accept", lambda o=offer: self._accept_offer(o), height=34
+            ).pack(side="left", padx=(0, 8))
+            secondary_button(
+                buttons, "Decline", lambda o=offer: self._decline_offer(o), width=90
+            ).pack(side="left")
+
+        history = card(wrap)
+        history.grid(row=0, column=1, sticky="nsew")
+        history.grid_rowconfigure(1, weight=1)
+        history.grid_columnconfigure(0, weight=1)
+        heading(history, "Recent activity").grid(
+            row=0, column=0, sticky="w", padx=18, pady=(16, 8)
+        )
+        past = scrollable(history)
+        past.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+
+        closed = [o for o in self.inbox if o.get("state") not in {"PENDING", "OWNER_CONFIRMED"}]
+        if not closed:
+            EmptyState(past, "Nothing yet").pack(fill="x")
+        for offer in closed[:25]:
+            ListRow(
+                past,
+                money(offer.get("payoutInr")),
+                f"{offer.get('id')}  |  {relative_time(offer.get('createdAt'))}",
+                state_label(offer.get("state", "")),
+                state_color(offer.get("state", "")),
+            ).pack(fill="x", pady=4, padx=2)
+
+    # ---- fleet ----
+    def _render_fleet(self) -> None:
+        wrap = ctk.CTkFrame(self.content, fg_color="transparent")
+        wrap.grid(row=0, column=0, sticky="nsew")
+        wrap.grid_columnconfigure(0, weight=2, uniform="f")
+        wrap.grid_columnconfigure(1, weight=3, uniform="f")
+        wrap.grid_rowconfigure(0, weight=1)
+
+        listing_card = card(wrap)
+        listing_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        listing_card.grid_rowconfigure(1, weight=1)
+        listing_card.grid_columnconfigure(0, weight=1)
+
+        head = ctk.CTkFrame(listing_card, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 6))
+        head.grid_columnconfigure(0, weight=1)
+        heading(head, "Trucks").grid(row=0, column=0, sticky="w")
+        secondary_button(head, "Add truck", self._open_add_truck, width=98).grid(
+            row=0, column=1, sticky="e"
+        )
+
+        listing = scrollable(listing_card)
+        listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(4, 14))
+
+        if not self.fleet:
+            EmptyState(
+                listing, "No trucks registered", "Add a truck to start tracking it."
+            ).pack(fill="x")
+        for truck in self.fleet:
+            live = truck.get("positionIsLive")
+            subtitle = (
+                f"{truck.get('latitude', 0):.4f}, {truck.get('longitude', 0):.4f}  |  "
+                + (
+                    f"live {relative_time(truck.get('lastSeenAt'))}"
+                    if live
+                    else "registered position only"
+                )
+            )
+            ListRow(
+                listing,
+                truck.get("registrationNumber", truck["truckId"]),
+                subtitle,
+                truck.get("status", "").replace("_", " "),
+                state_color(truck.get("status", "")),
+                on_click=lambda t=truck: self._focus_truck(t),
+            ).pack(fill="x", pady=4, padx=2)
+
+        self.map_panel = MapPanel(wrap, height=420)
+        self.map_panel.grid(row=0, column=1, sticky="nsew")
+        self.map_panel.set_title("Fleet positions", "OpenStreetMap")
+        self._draw_map()
+
+    def _focus_truck(self, truck: Dict[str, Any]) -> None:
+        if hasattr(self, "map_panel") and truck.get("latitude") is not None:
+            self.map_panel.focus_on(truck["latitude"], truck["longitude"], zoom=13)
+
+    # ---- telemetry ----
+    def _render_telemetry(self) -> None:
+        holder = card(self.content)
+        holder.grid(row=0, column=0, sticky="nsew")
+        holder.grid_rowconfigure(1, weight=1)
+        holder.grid_columnconfigure(0, weight=1)
+
+        heading(holder, "Open alerts").grid(row=0, column=0, sticky="w", padx=18, pady=(16, 2))
+        body(
+            holder,
+            "Derived from telemetry: a truck that has stopped moving, gone "
+            "quiet, jumped impossibly far, or let its cargo out of range.",
+            size=11,
+        ).grid(row=0, column=0, sticky="w", padx=18, pady=(34, 0))
+
+        listing = scrollable(holder)
+        listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(14, 14))
+
+        if not self.alerts:
+            EmptyState(
+                listing,
+                "Nothing to report",
+                "Alerts appear here when the fleet's telemetry says something "
+                "is wrong.",
+            ).pack(fill="x")
+
+        for alert in self.alerts:
+            entry = card(listing, fg_color=COLORS["row"])
+            entry.pack(fill="x", pady=5)
+
+            row = ctk.CTkFrame(entry, fg_color="transparent")
+            row.pack(fill="x", padx=14, pady=(12, 2))
+            heading(row, alert.get("type", "").replace("_", " ").title(), size=14).pack(
+                side="left"
+            )
+            fg, bg = severity_color(alert.get("severity", ""))
+            badge(row, alert.get("severity", ""), fg, bg).pack(side="right")
+
+            detail = alert.get("lastValue") or {}
+            summary = ", ".join(f"{k}: {v}" for k, v in list(detail.items())[:3])
+            body(entry, summary or "--", size=11).pack(anchor="w", padx=14)
+            body(
+                entry,
+                f"Truck {alert.get('truckId')}  |  opened {relative_time(alert.get('openedAt'))}"
+                # The occurrence count is what distinguishes a brief pause from
+                # a six-hour standstill; both are one alert row.
+                f"  |  seen {alert.get('occurrenceCount')}x",
+                size=10,
+            ).pack(anchor="w", padx=14, pady=(2, 0))
+
+            buttons = ctk.CTkFrame(entry, fg_color="transparent")
+            buttons.pack(fill="x", padx=14, pady=(8, 12))
+            secondary_button(
+                buttons, "Acknowledge", lambda a=alert: self._ack_alert(a), width=110
+            ).pack(side="left", padx=(0, 8))
+            secondary_button(
+                buttons, "Resolve", lambda a=alert: self._resolve_alert(a), width=90
+            ).pack(side="left")
+
+    # ---- sos ----
+    def _render_sos(self) -> None:
+        wrap = ctk.CTkFrame(self.content, fg_color="transparent")
+        wrap.grid(row=0, column=0, sticky="nsew")
+        wrap.grid_columnconfigure(0, weight=1, uniform="s")
+        wrap.grid_columnconfigure(1, weight=1, uniform="s")
+        wrap.grid_rowconfigure(0, weight=1)
+
+        own = card(wrap)
+        own.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        own.grid_rowconfigure(1, weight=1)
+        own.grid_columnconfigure(0, weight=1)
+        heading(own, "Our drivers").grid(row=0, column=0, sticky="w", padx=18, pady=(16, 8))
+
+        own_list = scrollable(own)
+        own_list.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        if not self.own_sos:
+            EmptyState(own_list, "No active emergencies", "Everyone is safe.").pack(fill="x")
+        for alert in self.own_sos:
+            self._render_sos_card(own_list, alert, own=True)
+
+        nearby = card(wrap)
+        nearby.grid(row=0, column=1, sticky="nsew")
+        nearby.grid_rowconfigure(1, weight=1)
+        nearby.grid_columnconfigure(0, weight=1)
+        heading(nearby, "Nearby on the network").grid(
+            row=0, column=0, sticky="w", padx=18, pady=(16, 2)
+        )
+        body(
+            nearby,
+            "Other carriers' drivers close to our trucks. Details are limited "
+            "until we offer help.",
+            size=11,
+        ).grid(row=0, column=0, sticky="w", padx=18, pady=(34, 0))
+
+        nearby_list = scrollable(nearby)
+        nearby_list.grid(row=1, column=0, sticky="nsew", padx=14, pady=(14, 14))
+        if not self.nearby_sos:
+            EmptyState(nearby_list, "Nothing nearby").pack(fill="x")
+        for alert in self.nearby_sos:
+            self._render_sos_card(nearby_list, alert, own=False)
+
+    def _render_sos_card(self, master: Any, alert: Dict[str, Any], own: bool) -> None:
+        entry = card(master, fg_color=COLORS["red_soft"] if own else COLORS["row"])
+        entry.pack(fill="x", pady=5)
+
+        row = ctk.CTkFrame(entry, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=(12, 2))
+        heading(row, alert.get("category", "").replace("_", " ").title(), size=14).pack(
+            side="left"
+        )
+        fg, bg = severity_color(alert.get("severity", ""))
+        badge(row, alert.get("severity", ""), fg, bg).pack(side="right")
+
+        if own:
+            condition = alert.get("condition") or {}
+            bits = []
+            if condition.get("personsAffected") is not None:
+                bits.append(f"{condition['personsAffected']} affected")
+            if condition.get("isConscious") is False:
+                bits.append("unconscious")
+            if condition.get("severeBleeding"):
+                bits.append("severe bleeding")
+            if condition.get("note"):
+                bits.append(condition["note"])
+            body(entry, " | ".join(bits) or "No condition detail", size=11).pack(
+                anchor="w", padx=14
+            )
+            body(
+                entry,
+                f"{alert.get('latitude'):.4f}, {alert.get('longitude'):.4f}"
+                + (f"  |  {alert.get('landmarkNote')}" if alert.get("landmarkNote") else ""),
+                size=10,
+            ).pack(anchor="w", padx=14, pady=(2, 0))
+        else:
+            body(
+                entry,
+                f"~{alert.get('distanceKm', 0):.1f} km away  |  "
+                + ", ".join(alert.get("assistanceNeeded") or []),
+                size=11,
+            ).pack(anchor="w", padx=14)
+            body(
+                entry,
+                f"Approx {alert.get('approxLat')}, {alert.get('approxLng')} "
+                f"({alert.get('locationPrecision')})",
+                size=10,
+            ).pack(anchor="w", padx=14, pady=(2, 0))
+
+        # Stated on every card. This platform does not call the emergency
+        # services, and an operator must never believe otherwise.
+        body(
+            entry,
+            "CargoResQ does not dispatch emergency services. Dial 112 for "
+            "police, ambulance or fire.",
+            size=9,
+            color=COLORS["muted"],
+        ).pack(anchor="w", padx=14, pady=(6, 0))
+
+        buttons = ctk.CTkFrame(entry, fg_color="transparent")
+        buttons.pack(fill="x", padx=14, pady=(8, 12))
+        if own:
+            secondary_button(
+                buttons, "Mark resolved", lambda a=alert: self._resolve_sos(a), width=120
+            ).pack(side="left")
+        else:
+            primary_button(
+                buttons, "We can help", lambda a=alert: self._offer_sos_help(a), height=34
+            ).pack(side="left", padx=(0, 8))
+            secondary_button(
+                buttons, "Acknowledge", lambda a=alert: self._ack_sos(a), width=110
+            ).pack(side="left")
+
+    # ---- shipments ----
+    def _render_shipments(self) -> None:
+        holder = card(self.content)
+        holder.grid(row=0, column=0, sticky="nsew")
+        holder.grid_rowconfigure(1, weight=1)
+        holder.grid_columnconfigure(0, weight=1)
+
+        head = ctk.CTkFrame(holder, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 8))
+        head.grid_columnconfigure(0, weight=1)
+        heading(head, "Cargo in transit").grid(row=0, column=0, sticky="w")
+        secondary_button(head, "Add shipment", self._open_add_shipment, width=120).grid(
+            row=0, column=1, sticky="e"
+        )
+
+        listing = scrollable(holder)
+        listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        if not self.shipments:
+            EmptyState(listing, "No shipments", "Add a shipment to track it.").pack(fill="x")
+        for shipment in self.shipments:
+            conditions = []
+            if shipment.get("requires_refrigeration"):
+                conditions.append(f"max {shipment.get('required_max_temp_c')}C")
+            if shipment.get("is_hazmat"):
+                conditions.append("hazmat")
+            ListRow(
+                listing,
+                shipment.get("cargo_type", "Cargo"),
+                f"{money(shipment.get('value_inr'))}  |  "
+                f"{shipment.get('weight_kg')} kg  |  "
+                + (", ".join(conditions) or "no special handling"),
+                state_label(shipment.get("status", "")),
+                state_color(shipment.get("status", "")),
+                on_click=lambda s=shipment: self._show_cold_chain(s),
+            ).pack(fill="x", pady=4, padx=2)
+
+    # -- actions ---------------------------------------------------------
+    def select_incident(self, incident_id: str) -> None:
+        self.selected_incident_id = incident_id
+        self.selected_offers = []
+
+        def work():
+            try:
+                offers = self.master_app.client.incident_offers(incident_id)
+            except ApiError:
+                offers = []
+            self.after(0, lambda: self._set_offers(offers))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.render()
+
+    def _set_offers(self, offers: List[Dict[str, Any]]) -> None:
+        self.selected_offers = offers
+        if self.active_tab == "Command centre":
+            self._render_incident_detail()
+
+    def _safe_after(self, callback: Callable[[], Any]) -> None:
+        """Marshal back to the Tk thread, unless the view has gone.
+
+        A refresh started before the operator signed out will still complete
+        on its worker thread; scheduling onto a destroyed widget raises.
+        """
         try:
-            result = self.master_app.client.run_simulation(self.scenario.get())
-            self.master_app.set_status(f"Simulation started: {result.get('scenario')}")
-            self.after(700, self.refresh)
-        except ApiError as exc:
-            self.master_app.set_status(str(exc))
+            if self.winfo_exists():
+                self.after(0, callback)
+        except Exception:
+            pass
+
+    def _run(self, work: Callable[[], Any], success: str) -> None:
+        """Run an API call off the UI thread and report what happened."""
+
+        def task():
+            try:
+                work()
+                self.after(0, lambda: self.master_app.set_status(success))
+                self.after(0, self.refresh)
+                if self.selected_incident_id:
+                    self.after(0, lambda: self.select_incident(self.selected_incident_id))
+            except ApiError as exc:
+                self.after(0, lambda: messagebox.showerror("CargoResQ", str(exc)))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _find_rescuers(self, incident: Dict[str, Any]) -> None:
+        self._run(
+            lambda: self.master_app.client.advance_incident(incident["id"], "MATCHING"),
+            "Searching for compatible trucks.",
+        )
+
+    def _send_offers(self, incident: Dict[str, Any]) -> None:
+        self._run(
+            lambda: self.master_app.client.fan_out_offers(incident["id"]),
+            "Offers sent to nearby compatible carriers.",
+        )
+
+    def _confirm_offer(self, offer: Dict[str, Any]) -> None:
+        self._run(
+            lambda: self.master_app.client.confirm_offer(offer["id"]),
+            "Confirmed. The rescue binds once the carrier also accepts.",
+        )
+
+    def _withdraw_offer(self, offer: Dict[str, Any]) -> None:
+        self._run(
+            lambda: self.master_app.client.withdraw_offer(offer["id"], "Withdrawn by owner"),
+            "Offer withdrawn.",
+        )
+
+    def _accept_offer(self, offer: Dict[str, Any]) -> None:
+        self._run(
+            lambda: self.master_app.client.accept_offer_as_carrier(offer["id"]),
+            "Accepted. The rescue binds once the customer also confirms.",
+        )
+
+    def _decline_offer(self, offer: Dict[str, Any]) -> None:
+        self._run(
+            lambda: self.master_app.client.decline_offer_as_carrier(offer["id"], "Unavailable"),
+            "Declined.",
+        )
+
+    def _ack_alert(self, alert: Dict[str, Any]) -> None:
+        self._run(
+            lambda: self.master_app.client.acknowledge_alert(alert["id"]), "Alert acknowledged."
+        )
+
+    def _resolve_alert(self, alert: Dict[str, Any]) -> None:
+        self._run(
+            lambda: self.master_app.client.resolve_alert(alert["id"], "Resolved from console"),
+            "Alert resolved.",
+        )
+
+    def _ack_sos(self, alert: Dict[str, Any]) -> None:
+        sos_id = alert.get("sosId") or alert.get("id")
+        if not sos_id:
+            return
+        self._run(
+            lambda: self.master_app.client.acknowledge_sos(sos_id),
+            "Acknowledged. The exact location is now visible.",
+        )
+
+    def _offer_sos_help(self, alert: Dict[str, Any]) -> None:
+        sos_id = alert.get("sosId") or alert.get("id")
+        if not sos_id:
+            return
+
+        def work():
+            self.master_app.client.acknowledge_sos(sos_id)
+            self.master_app.client.respond_to_sos(sos_id, "EN_ROUTE", eta_minutes=None)
+
+        self._run(work, "Marked en route.")
+
+    def _resolve_sos(self, alert: Dict[str, Any]) -> None:
+        self._run(
+            lambda: self.master_app.client.resolve_sos(alert["id"], "RESOLVED_SAFE"),
+            "SOS resolved.",
+        )
+
+    def _show_timeline(self, incident_id: str) -> None:
+        def work():
+            try:
+                events = self.master_app.client.incident_timeline(incident_id)
+                sla = self.master_app.client.incident_sla(incident_id)
+            except ApiError as exc:
+                self.after(0, lambda: messagebox.showerror("CargoResQ", str(exc)))
+                return
+            self.after(0, lambda: self.master_app.open_timeline(incident_id, events, sla))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_escrow(self, offer: Dict[str, Any]) -> None:
+        escrow_id = offer.get("escrowId")
+        if not escrow_id:
+            return
+
+        def work():
+            try:
+                ledger = self.master_app.client.escrow_ledger(escrow_id)
+                escrow = self.master_app.client.escrow(escrow_id)
+            except ApiError as exc:
+                self.after(0, lambda: messagebox.showerror("CargoResQ", str(exc)))
+                return
+            self.after(0, lambda: self.master_app.open_escrow(escrow, ledger))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_cold_chain(self, shipment: Dict[str, Any]) -> None:
+        def work():
+            try:
+                data = self.master_app.client.cold_chain(shipment["id"])
+            except ApiError as exc:
+                self.after(0, lambda: messagebox.showerror("CargoResQ", str(exc)))
+                return
+            self.after(0, lambda: self.master_app.open_cold_chain(shipment, data))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _open_report_breakdown(self) -> None:
+        self.master_app.open_breakdown_dialog(self.shipments, self.fleet)
+
+    def _open_add_truck(self) -> None:
+        self.master_app.open_add_truck_dialog()
+
+    def _open_add_shipment(self) -> None:
+        self.master_app.open_add_shipment_dialog(self.fleet)
+
+    # -- live feed -------------------------------------------------------
+    def start_live_feed(self) -> None:
+        client = self.master_app.client
+        if not client.token:
+            return
+        self.feed = LiveFeed(client.websocket_url, client.token)
+        self.feed.start()
+
+    def _poll_events(self) -> None:
+        if self.feed is not None:
+            events = self.feed.drain()
+            if events:
+                self._handle_events(events)
+            self.feed_status.configure(
+                text="● live" if self.feed.connected else "● reconnecting",
+                text_color=COLORS["sidebar_eyebrow"]
+                if self.feed.connected
+                else COLORS["amber"],
+            )
+        self.after(EVENT_POLL_MS, self._poll_events)
+
+    def _handle_events(self, events: List[Dict[str, Any]]) -> None:
+        """React to server-pushed events.
+
+        Anything that changes what is on screen triggers a refresh rather than
+        a partial in-place update -- the server is the source of truth, and a
+        console that patches its own state drifts from it.
+        """
+        interesting = {
+            "breakdown.detected",
+            "offer.created",
+            "offer.bound",
+            "offer.carrier_accepted",
+            "offer.owner_confirmed",
+            "escrow.state_changed",
+            "telemetry.alert",
+            "sos.raised",
+            "sos.acknowledged",
+            "sos.status_changed",
+        }
+        should_refresh = False
+        for event in events:
+            kind = event.get("type", "")
+            if kind.startswith("incident.") or kind in interesting:
+                should_refresh = True
+            if kind == "sos.raised":
+                payload = event.get("payload", {})
+                if payload.get("isOwnDriver"):
+                    self.master_app.set_status(
+                        f"SOS raised: {payload.get('category')} ({payload.get('severity')})"
+                    )
+        if should_refresh:
+            self.refresh()
+
+    def stop(self) -> None:
+        if self.feed is not None:
+            self.feed.stop()
+            self.feed = None
 
 
 class CargoResQApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("CargoResQ — Operations Console")
-        self.geometry("1280x800")
-        self.minsize(1050, 680)
+        self.title("CargoResQ Operations Console")
+        self.geometry("1440x900")
+        self.minsize(1180, 740)
         self.configure(fg_color=COLORS["canvas"])
+
         self.client = CargoResQClient()
-        self._status = ""
+        self.dashboard: Optional[DashboardView] = None
+
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        self.status_bar = ctk.CTkLabel(
+            self, text="", text_color=COLORS["muted"], anchor="w",
+            font=ctk.CTkFont(size=11),
+        )
+        self.status_bar.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 6))
+
+        self.container: Optional[ctk.CTkFrame] = None
         self.show_login()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _swap(self, view: ctk.CTkFrame) -> None:
+        if self.container is not None:
+            if isinstance(self.container, DashboardView):
+                self.container.stop()
+            self.container.destroy()
+        self.container = view
+        view.grid(row=0, column=0, sticky="nsew")
 
     def show_login(self) -> None:
-        for child in self.winfo_children():
-            child.destroy()
-        LoginView(self, self.login).pack(fill="both", expand=True)
+        self.dashboard = None
+        self._swap(LoginView(self))
 
-    def login(self, endpoint: str, email: str, password: str) -> None:
-        self.client = CargoResQClient(endpoint)
-        data = self.client.login(email, password)
-        self.after(0, lambda: self.show_dashboard(data))
+    def show_dashboard(self) -> None:
+        self.dashboard = DashboardView(self)
+        self._swap(self.dashboard)
+        self.dashboard.company_label.configure(
+            text=(self.client.company_name or "").upper()
+        )
+        self.set_status(f"Signed in as {self.client.company_name}")
 
-    def show_dashboard(self, _profile: dict[str, Any] | None = None) -> None:
-        for child in self.winfo_children():
-            child.destroy()
-        DashboardView(self).pack(fill="both", expand=True)
+    def connect(self, endpoint: str, email: str, password: str) -> None:
+        self.client = CargoResQClient(endpoint or DEFAULT_API_URL)
+        self.client.login(email, password)
+
+    def sign_out(self) -> None:
+        self.client.logout()
+        self.show_login()
 
     def set_status(self, message: str) -> None:
-        self._status = message
+        self.status_bar.configure(text=message)
+
+    def _on_close(self) -> None:
+        if isinstance(self.container, DashboardView):
+            self.container.stop()
+        self.destroy()
+
+    # -- dialogs ---------------------------------------------------------
+    def _dialog(self, title: str, width: int = 620, height: int = 560) -> ctk.CTkToplevel:
+        window = ctk.CTkToplevel(self)
+        window.title(title)
+        window.geometry(f"{width}x{height}")
+        window.configure(fg_color=COLORS["canvas"])
+        window.transient(self)
+        # Grab must wait for the window to be mapped, or it fails on Windows.
+        window.after(120, lambda: window.grab_set() if window.winfo_exists() else None)
+        return window
+
+    def open_timeline(self, incident_id: str, events: List[Dict], sla: Dict) -> None:
+        window = self._dialog(f"Audit trail - {incident_id}")
+        heading(window, "Audit trail", size=18).pack(anchor="w", padx=24, pady=(22, 2))
+        body(
+            window,
+            "Append-only. Every state change, who made it and when.",
+            size=11,
+        ).pack(anchor="w", padx=24, pady=(0, 14))
+
+        rows = [
+            (key.title(), f"{value.get('status')} ({value.get('actualSec') or '--'}s)")
+            for key, value in sla.items()
+        ]
+        KeyValueGrid(window, rows).pack(fill="x", padx=24, pady=(0, 14))
+
+        listing = scrollable(window)
+        listing.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+        for event in events:
+            ListRow(
+                listing,
+                state_label(event.get("newState") or event.get("type", "")),
+                f"{event.get('actorId', 'system')}  |  {relative_time(event.get('createdAt'))}",
+            ).pack(fill="x", pady=3, padx=2)
+
+    def open_escrow(self, escrow: Dict, ledger: Dict) -> None:
+        window = self._dialog("Escrow", height=600)
+        heading(window, "Escrow", size=18).pack(anchor="w", padx=24, pady=(22, 2))
+        body(
+            window,
+            "Funds are held from the moment both parties commit, and released "
+            "only once the recorded condition log confirms in-spec delivery.",
+            size=11,
+        ).pack(anchor="w", padx=24, pady=(0, 14))
+
+        KeyValueGrid(
+            window,
+            [
+                ("State", state_label(escrow.get("state", ""))),
+                ("Amount", money(escrow.get("amountInr"))),
+                ("Carrier payout", money(escrow.get("carrierPayoutInr"))),
+                ("Balanced", "yes" if ledger.get("balance", {}).get("balanced") else "NO"),
+            ],
+        ).pack(fill="x", padx=24, pady=(0, 14))
+
+        listing = scrollable(window)
+        listing.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+        for entry in ledger.get("entries", []):
+            amount = entry.get("debitInr") or entry.get("creditInr")
+            side = "debit" if entry.get("debitInr") else "credit"
+            ListRow(
+                listing,
+                f"{entry.get('account')}  {side} {money(amount)}",
+                f"{entry.get('postingType')}  |  {entry.get('memo') or ''}",
+            ).pack(fill="x", pady=3, padx=2)
+
+    def open_cold_chain(self, shipment: Dict, data: Dict) -> None:
+        window = self._dialog("Cold chain", height=580)
+        heading(window, shipment.get("cargo_type", "Shipment"), size=18).pack(
+            anchor="w", padx=24, pady=(22, 2)
+        )
+        body(window, "Condition readings recorded by the platform.", size=11).pack(
+            anchor="w", padx=24, pady=(0, 14)
+        )
+
+        KeyValueGrid(
+            window,
+            [
+                ("Required max", f"{data.get('requiredMaxTempC')} C"),
+                ("Readings", str(data.get("readingCount", 0))),
+                ("Range", f"{data.get('minTempC')} to {data.get('maxTempC')} C"),
+                ("Breaches", str(data.get("breachCount", 0))),
+            ],
+        ).pack(fill="x", padx=24, pady=(0, 14))
+
+        listing = scrollable(window)
+        listing.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+        if not data.get("readings"):
+            EmptyState(
+                listing,
+                "No readings recorded",
+                "Escrow cannot be settled automatically without condition data. "
+                "It will report insufficient evidence rather than release funds.",
+            ).pack(fill="x")
+        for reading in data.get("readings", [])[-40:]:
+            ListRow(
+                listing,
+                f"{reading.get('temperatureC')} C",
+                f"{relative_time(reading.get('at'))}  |  {reading.get('trustLevel')}",
+            ).pack(fill="x", pady=3, padx=2)
+
+    def open_breakdown_dialog(self, shipments: List[Dict], fleet: List[Dict]) -> None:
+        window = self._dialog("Report a breakdown", height=520)
+        heading(window, "Report a breakdown", size=18).pack(anchor="w", padx=24, pady=(22, 2))
+        body(
+            window,
+            "Normally raised by the driver from the app. Use this when a "
+            "driver has reported by phone.",
+            size=11,
+        ).pack(anchor="w", padx=24, pady=(0, 16))
+
+        in_transit = [s for s in shipments if s.get("status") == "in_transit"]
+        if not in_transit:
+            EmptyState(window, "No shipments in transit").pack(fill="x", padx=24)
+            return
+
+        labels = [f"{s['cargo_type']} ({s['id']})" for s in in_transit]
+        choice = ctk.CTkOptionMenu(window, values=labels, width=520, height=36,
+                                   fg_color=COLORS["card"], button_color=COLORS["teal"],
+                                   text_color=COLORS["ink"])
+        choice.pack(padx=24, pady=(0, 12))
+
+        lat_entry = self._labelled_entry(window, "Latitude", "18.5204")
+        lng_entry = self._labelled_entry(window, "Longitude", "73.8567")
+        hours_entry = self._labelled_entry(window, "Hours until cargo is at risk", "2")
+
+        status = body(window, "", size=11, color=COLORS["red"])
+        status.pack(anchor="w", padx=24)
+
+        def submit():
+            index = labels.index(choice.get())
+            shipment = in_transit[index]
+            try:
+                payload = {
+                    "shipment_id": shipment["id"],
+                    "lat": float(lat_entry.get()),
+                    "lng": float(lng_entry.get()),
+                    "hours_to_spoilage": float(hours_entry.get() or 0) or None,
+                }
+            except ValueError:
+                status.configure(text="Latitude, longitude and hours must be numbers.")
+                return
+
+            def work():
+                self.client.report_breakdown(payload)
+
+            try:
+                work()
+            except ApiError as exc:
+                status.configure(text=str(exc))
+                return
+            window.destroy()
+            if self.dashboard:
+                self.dashboard.refresh()
+
+        primary_button(window, "Report breakdown", submit, width=520).pack(
+            padx=24, pady=18
+        )
+
+    def open_add_truck_dialog(self) -> None:
+        window = self._dialog("Add a truck", height=640)
+        heading(window, "Add a truck", size=18).pack(anchor="w", padx=24, pady=(22, 14))
+
+        reg = self._labelled_entry(window, "Registration number", "")
+        lat = self._labelled_entry(window, "Latitude", "18.5204")
+        lng = self._labelled_entry(window, "Longitude", "73.8567")
+        volume = self._labelled_entry(window, "Max volume (m3)", "18")
+        weight = self._labelled_entry(window, "Max payload (kg)", "5000")
+        min_temp = self._labelled_entry(window, "Minimum temperature (C, blank if not reefer)", "")
+
+        refrigerated = ctk.CTkCheckBox(window, text="Refrigerated", text_color=COLORS["ink"])
+        refrigerated.pack(anchor="w", padx=24, pady=(4, 2))
+        hazmat = ctk.CTkCheckBox(window, text="Hazmat certified", text_color=COLORS["ink"])
+        hazmat.pack(anchor="w", padx=24, pady=(0, 8))
+
+        status = body(window, "", size=11, color=COLORS["red"])
+        status.pack(anchor="w", padx=24)
+
+        def submit():
+            try:
+                payload = {
+                    "registration_number": reg.get().strip(),
+                    "latitude": float(lat.get()),
+                    "longitude": float(lng.get()),
+                    "max_volume_m3": float(volume.get()),
+                    "max_weight_kg": float(weight.get()),
+                    "refrigerated": bool(refrigerated.get()),
+                    "hazmat_certified": bool(hazmat.get()),
+                    "min_temp_c": float(min_temp.get()) if min_temp.get().strip() else None,
+                }
+            except ValueError:
+                status.configure(text="Check the numeric fields.")
+                return
+            try:
+                self.client.create_truck(payload)
+            except ApiError as exc:
+                status.configure(text=str(exc))
+                return
+            window.destroy()
+            if self.dashboard:
+                self.dashboard.refresh()
+
+        primary_button(window, "Add truck", submit, width=520).pack(padx=24, pady=16)
+
+    def open_add_shipment_dialog(self, fleet: List[Dict]) -> None:
+        window = self._dialog("Add a shipment", height=660)
+        heading(window, "Add a shipment", size=18).pack(anchor="w", padx=24, pady=(22, 14))
+
+        if not fleet:
+            EmptyState(window, "Register a truck first").pack(fill="x", padx=24)
+            return
+
+        labels = [f"{t.get('registrationNumber')} ({t['truckId']})" for t in fleet]
+        truck_choice = ctk.CTkOptionMenu(window, values=labels, width=520, height=36,
+                                         fg_color=COLORS["card"], button_color=COLORS["teal"],
+                                         text_color=COLORS["ink"])
+        truck_choice.pack(padx=24, pady=(0, 12))
+
+        cargo = self._labelled_entry(window, "Cargo description", "Refrigerated insulin")
+        value = self._labelled_entry(window, "Declared value (INR)", "480000")
+        weight = self._labelled_entry(window, "Weight (kg)", "850")
+        volume = self._labelled_entry(window, "Volume (m3)", "3.5")
+        max_temp = self._labelled_entry(window, "Maximum temperature (C, blank if none)", "8")
+
+        refrigerated = ctk.CTkCheckBox(window, text="Requires refrigeration", text_color=COLORS["ink"])
+        refrigerated.select()
+        refrigerated.pack(anchor="w", padx=24, pady=(4, 2))
+        hazmat = ctk.CTkCheckBox(window, text="Hazmat", text_color=COLORS["ink"])
+        hazmat.pack(anchor="w", padx=24, pady=(0, 8))
+
+        status = body(window, "", size=11, color=COLORS["red"])
+        status.pack(anchor="w", padx=24)
+
+        def submit():
+            try:
+                payload = {
+                    "truck_id": fleet[labels.index(truck_choice.get())]["truckId"],
+                    "cargo_type": cargo.get().strip(),
+                    "value_inr": float(value.get()),
+                    "weight_kg": float(weight.get()),
+                    "volume_m3": float(volume.get()),
+                    "requires_refrigeration": bool(refrigerated.get()),
+                    "is_hazmat": bool(hazmat.get()),
+                    "required_max_temp_c": (
+                        float(max_temp.get()) if max_temp.get().strip() else None
+                    ),
+                }
+            except ValueError:
+                status.configure(text="Check the numeric fields.")
+                return
+            try:
+                self.client.create_shipment(payload)
+            except ApiError as exc:
+                status.configure(text=str(exc))
+                return
+            window.destroy()
+            if self.dashboard:
+                self.dashboard.refresh()
+
+        primary_button(window, "Add shipment", submit, width=520).pack(padx=24, pady=16)
+
+    def _labelled_entry(self, master: Any, label: str, initial: str) -> ctk.CTkEntry:
+        ctk.CTkLabel(
+            master, text=label, anchor="w", text_color=COLORS["muted"],
+            font=ctk.CTkFont(size=11),
+        ).pack(anchor="w", padx=24, pady=(6, 3))
+        entry = ctk.CTkEntry(
+            master, width=520, height=36, border_color=COLORS["line"], fg_color="#FAFCFB"
+        )
+        entry.pack(padx=24)
+        if initial:
+            entry.insert(0, initial)
+        return entry
 
 
 def main() -> None:
     ctk.set_appearance_mode("light")
     ctk.set_default_color_theme("blue")
-    app = CargoResQApp()
-    app.mainloop()
+    CargoResQApp().mainloop()
 
 
 if __name__ == "__main__":

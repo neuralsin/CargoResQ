@@ -4,21 +4,30 @@ Register new carrier companies and issue signed JWT access tokens.
 """
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from ..database import get_db
 from ..models import Company
 from ..auth import hash_password, verify_password, create_access_token
+from shared.rbac import Role
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
 
 class RegisterCompanyRequest(BaseModel):
-    name: str
+    """Self-service carrier registration.
+
+    Deliberately has no `role` field. The role is assigned by the server and
+    is always CARRIER_OWNER; accepting it from the request body allowed any
+    caller to mint an ADMIN token for themselves.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=2, max_length=128)
     email: EmailStr
-    password: str = Field(..., min_length=8)
-    role: str = "CARRIER_OWNER"
+    password: str = Field(..., min_length=8, max_length=128)
 
 
 class TokenResponse(BaseModel):
@@ -43,7 +52,7 @@ async def register(req: RegisterCompanyRequest, db: AsyncSession = Depends(get_d
         name=req.name,
         email=req.email,
         hashed_password=hash_password(req.password),
-        role=req.role,
+        role=Role.CARRIER_OWNER.value,
     )
     db.add(company)
     await db.commit()

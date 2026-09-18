@@ -1,7 +1,15 @@
 <resources>
     <string name="app_name">CargoResQ Driver</string>
+
     <string name="title_home">Home</string>
-    <string name="title_services">Services</string>
-    <string name="title_activity">Activity</string>
+    <string name="title_sos">SOS</string>
+    <string name="title_safety">Safety</string>
+    <string name="title_jobs">Jobs</string>
     <string name="title_account">Account</string>
+
+    <!-- Repeated wherever an emergency is on screen. CargoResQ alerts the
+         driver's company and nearby carriers; it does not call 112. -->
+    <string name="psap_disclaimer">CargoResQ alerts your company and nearby carriers. It does NOT call the emergency services. For a life-threatening emergency, tap Call 112.</string>
+
+    <string name="permission_location_rationale">CargoResQ shares your position with your dispatcher so they can find you if you break down, and so nearby help knows where to go. Without it, a rescue cannot be routed to you.</string>
 </resources>

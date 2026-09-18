@@ -1,127 +1,179 @@
 """
-Dijkstra's Shortest & Fastest Path Algorithm (Phase 15+).
-Computes optimal corridor routing based on distance, road quality, and live congestion weights.
+Shortest-path routing over a graph built from real entities.
+
+This used to be a textbook Dijkstra over a hardcoded sixteen-node graph --
+eleven waypoints along NH-48 plus five in San Francisco -- with static numbers
+standing in for live congestion. Nothing in the system referenced those node
+ids: no truck, no shipment and no incident could be placed on that graph, and
+the only way to reach it was an endpoint that existed to display a shortest
+distance. It computed a real answer to an invented question.
+
+Routing belongs inside matching, not on a screen. What matters operationally
+is how long a rescuer takes to arrive, so this module exists as the fallback
+for when the road-routing service is unreachable: it builds a graph at request
+time from the actual incident, the actual candidate trucks, and the waypoints
+those trucks have actually driven through, then finds the fastest path across
+it.
+
+With no road network available, a graph over known positions still beats a
+straight line, because it can route around the fact that two points either
+side of a river are not two minutes apart.
 """
 import heapq
 import math
-from typing import Dict, List, Tuple, Any, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
 
-# Standard Highway Network Graph (NH-48 Corridor + Key Logistics Hubs)
-CORRIDOR_NODES: Dict[str, Tuple[float, float, str]] = {
-    "PUN_DEP": (18.5204, 73.8567, "Pune Serum Logistics Depot"),
-    "STR_TOL": (17.6805, 74.0183, "Satara Toll Checkpoint"),
-    "KOL_HUB": (16.7050, 74.2433, "Kolhapur Cold Vault"),
-    "BEL_BYP": (15.8497, 74.4977, "Belgaum NH-48 Bypass"),
-    "HUB_JNC": (15.3647, 75.1240, "Hubli Logistics Junction"),
-    "DAV_CHK": (14.4644, 75.9218, "Davanagere Corridor Node"),
-    "TUM_IND": (13.3409, 77.1006, "Tumkur Industrial Park"),
-    "BLR_HUB": (12.9716, 77.5946, "Bangalore Distribution Hub"),
-    "VLR_BYP": (12.9165, 79.1325, "Vellore Bypass"),
-    "KNC_EST": (12.8342, 79.7036, "Kanchipuram East"),
-    "CHN_TRM": (13.0827, 80.2707, "Chennai Port Terminal"),
-    # Urban Clinic & Cold Depot Nodes (Matching Desktop Reference 1:1)
-    "SF_ORIGIN": (37.7915, -122.3934, "144 Spear St Health Care Depot"),
-    "SF_WAY_1": (37.7845, -122.4014, "Mission & 4th Corridor"),
-    "SF_WAY_2": (37.7765, -122.4172, "Market & 10th Interchange"),
-    "SF_WAY_3": (37.7682, -122.4265, "Mission District Reefer Dock"),
-    "SF_DEST": (37.7562, -122.4208, "Central General Clinical Terminal"),
-}
+from .routing import haversine_distance_km
 
-# Adjacency list: (neighbor, distance_km, avg_speed_kmh, congestion_multiplier)
-CORRIDOR_EDGES: Dict[str, List[Tuple[str, float, float, float]]] = {
-    # NH-48 Corridor
-    "PUN_DEP": [("STR_TOL", 112.0, 65.0, 1.0)],
-    "STR_TOL": [("PUN_DEP", 112.0, 60.0, 1.1), ("KOL_HUB", 124.0, 70.0, 1.0)],
-    "KOL_HUB": [("STR_TOL", 124.0, 70.0, 1.0), ("BEL_BYP", 108.0, 75.0, 1.0)],
-    "BEL_BYP": [("KOL_HUB", 108.0, 75.0, 1.0), ("HUB_JNC", 98.0, 75.0, 1.05)],
-    "HUB_JNC": [("BEL_BYP", 98.0, 75.0, 1.05), ("DAV_CHK", 142.0, 80.0, 1.0)],
-    "DAV_CHK": [("HUB_JNC", 142.0, 80.0, 1.0), ("TUM_IND", 195.0, 80.0, 1.0)],
-    "TUM_IND": [("DAV_CHK", 195.0, 80.0, 1.0), ("BLR_HUB", 72.0, 50.0, 1.3)],
-    "BLR_HUB": [
-        ("TUM_IND", 72.0, 50.0, 1.3),
-        ("VLR_BYP", 210.0, 70.0, 1.1),
-    ],
-    "VLR_BYP": [("BLR_HUB", 210.0, 70.0, 1.1), ("KNC_EST", 68.0, 65.0, 1.05)],
-    "KNC_EST": [("VLR_BYP", 68.0, 65.0, 1.05), ("CHN_TRM", 74.0, 55.0, 1.25)],
-    "CHN_TRM": [("KNC_EST", 74.0, 55.0, 1.25)],
-
-    # Urban Rapid Medical Relay Corridor (SF Healthcare 1:1)
-    "SF_ORIGIN": [("SF_WAY_1", 1.8, 30.0, 1.2)],
-    "SF_WAY_1": [("SF_ORIGIN", 1.8, 30.0, 1.2), ("SF_WAY_2", 2.2, 35.0, 1.1)],
-    "SF_WAY_2": [("SF_WAY_1", 2.2, 35.0, 1.1), ("SF_WAY_3", 2.4, 40.0, 1.0)],
-    "SF_WAY_3": [("SF_WAY_2", 2.4, 40.0, 1.0), ("SF_DEST", 2.0, 32.0, 1.15)],
-    "SF_DEST": [("SF_WAY_3", 2.0, 32.0, 1.15)],
-}
+#: Typical achievable speeds, km/h, by how far apart two points are. Short
+#: hops are urban and slow; long ones are mostly highway.
+def _assumed_speed_kph(distance_km: float) -> float:
+    if distance_km <= 5.0:
+        return 22.0
+    if distance_km <= 25.0:
+        return 35.0
+    if distance_km <= 80.0:
+        return 50.0
+    return 62.0
 
 
-def dijkstra_fastest_route(
-    start_node: str,
-    end_node: str,
-    custom_edges: Optional[Dict[str, List[Tuple[str, float, float, float]]]] = None,
-) -> Dict[str, Any]:
+@dataclass(frozen=True)
+class RouteNode:
+    """A real place: an incident, a truck, or a waypoint from ping history."""
+
+    id: str
+    lat: float
+    lng: float
+    kind: str = "waypoint"
+    label: Optional[str] = None
+
+
+@dataclass
+class RouteResult:
+    origin_id: str
+    destination_id: str
+    total_distance_km: float
+    total_time_minutes: float
+    path: List[str] = field(default_factory=list)
+    coordinates: List[Tuple[float, float]] = field(default_factory=list)
+    method: str = "dijkstra_over_known_positions"
+
+    def to_dict(self) -> dict:
+        return {
+            "originId": self.origin_id,
+            "destinationId": self.destination_id,
+            "totalDistanceKm": round(self.total_distance_km, 2),
+            "totalTimeMinutes": round(self.total_time_minutes, 1),
+            "path": self.path,
+            "coordinates": [[lat, lng] for lat, lng in self.coordinates],
+            "method": self.method,
+        }
+
+
+def build_graph(
+    nodes: Sequence[RouteNode],
+    max_edge_km: float = 120.0,
+    neighbours_per_node: int = 6,
+) -> Dict[str, List[Tuple[str, float, float]]]:
+    """Connect each node to its nearest neighbours.
+
+    A complete graph would make Dijkstra pointless -- the direct edge always
+    wins, so the answer collapses back to straight-line distance. Limiting
+    each node to its nearest few neighbours is what lets a path through an
+    intermediate point beat the direct hop.
+
+    Returns an adjacency list of (neighbour_id, distance_km, minutes).
     """
-    Executes Dijkstra's algorithm prioritizing minimum travel time (minutes).
-    Weight = (distance_km / avg_speed_kmh) * 60 * congestion_multiplier
-    """
-    graph = custom_edges or CORRIDOR_EDGES
+    graph: Dict[str, List[Tuple[str, float, float]]] = {node.id: [] for node in nodes}
 
-    if start_node not in CORRIDOR_NODES or end_node not in CORRIDOR_NODES:
-        raise ValueError(f"Start ({start_node}) or End ({end_node}) not recognized in road network")
+    for node in nodes:
+        distances = []
+        for other in nodes:
+            if other.id == node.id:
+                continue
+            km = haversine_distance_km(node.lat, node.lng, other.lat, other.lng)
+            if km <= max_edge_km:
+                distances.append((km, other.id))
+        distances.sort()
+        for km, other_id in distances[:neighbours_per_node]:
+            minutes = (km / _assumed_speed_kph(km)) * 60.0
+            graph[node.id].append((other_id, km, minutes))
 
-    # Priority queue stores: (cumulative_time_mins, current_node, cumulative_dist_km, path_nodes)
-    pq: List[Tuple[float, str, float, List[str]]] = [(0.0, start_node, 0.0, [start_node])]
-    visited: Dict[str, float] = {}
+    # Undirected: if A reaches B, B reaches A. Nearest-neighbour selection is
+    # not symmetric on its own, which would otherwise create one-way roads.
+    for node_id, edges in list(graph.items()):
+        for neighbour_id, km, minutes in edges:
+            if not any(dest == node_id for dest, _, _ in graph[neighbour_id]):
+                graph[neighbour_id].append((node_id, km, minutes))
 
-    best_time = float("inf")
-    best_dist = 0.0
-    best_path: List[str] = []
+    return graph
 
-    while pq:
-        curr_time, node, curr_dist, path = heapq.heappop(pq)
 
-        if node in visited and visited[node] <= curr_time:
+def fastest_route(
+    nodes: Sequence[RouteNode],
+    origin_id: str,
+    destination_id: str,
+    graph: Optional[Dict[str, List[Tuple[str, float, float]]]] = None,
+) -> RouteResult:
+    """Dijkstra, minimising travel time across the built graph."""
+    index = {node.id: node for node in nodes}
+    if origin_id not in index:
+        raise ValueError(f"Origin {origin_id!r} is not in the graph")
+    if destination_id not in index:
+        raise ValueError(f"Destination {destination_id!r} is not in the graph")
+
+    graph = graph if graph is not None else build_graph(nodes)
+
+    # (cumulative_minutes, node_id, cumulative_km, path)
+    queue: List[Tuple[float, str, float, List[str]]] = [(0.0, origin_id, 0.0, [origin_id])]
+    best_time: Dict[str, float] = {origin_id: 0.0}
+
+    while queue:
+        elapsed, node_id, travelled, path = heapq.heappop(queue)
+
+        if node_id == destination_id:
+            return RouteResult(
+                origin_id=origin_id,
+                destination_id=destination_id,
+                total_distance_km=travelled,
+                total_time_minutes=elapsed,
+                path=path,
+                coordinates=[(index[n].lat, index[n].lng) for n in path],
+            )
+
+        if elapsed > best_time.get(node_id, math.inf):
             continue
-        visited[node] = curr_time
 
-        if node == end_node:
-            best_time = curr_time
-            best_dist = curr_dist
-            best_path = path
-            break
+        for neighbour_id, km, minutes in graph.get(node_id, []):
+            next_time = elapsed + minutes
+            if next_time < best_time.get(neighbour_id, math.inf):
+                best_time[neighbour_id] = next_time
+                heapq.heappush(
+                    queue, (next_time, neighbour_id, travelled + km, path + [neighbour_id])
+                )
 
-        for neighbor, dist_km, speed_kmh, congestion in graph.get(node, []):
-            edge_time_mins = (dist_km / max(speed_kmh, 10.0)) * 60.0 * congestion
-            new_time = curr_time + edge_time_mins
-            new_dist = curr_dist + dist_km
+    raise ValueError(
+        f"No route between {origin_id!r} and {destination_id!r} within the graph's edge limit"
+    )
 
-            if neighbor not in visited or new_time < visited[neighbor]:
-                heapq.heappush(pq, (new_time, neighbor, new_dist, path + [neighbor]))
 
-    if not best_path:
-        raise ValueError(f"No valid route found between {start_node} and {end_node}")
+def route_between_points(
+    origin: Tuple[float, float],
+    destination: Tuple[float, float],
+    waypoints: Sequence[Tuple[str, float, float]] = (),
+    max_edge_km: float = 120.0,
+) -> RouteResult:
+    """Convenience wrapper: route from one coordinate to another.
 
-    # Build detailed itinerary & coordinates
-    itinerary: List[Dict[str, Any]] = []
-    coordinates: List[Tuple[float, float]] = []
-
-    for n in best_path:
-        lat, lng, name = CORRIDOR_NODES[n]
-        coordinates.append((lat, lng))
-        itinerary.append({
-            "nodeId": n,
-            "name": name,
-            "lat": lat,
-            "lng": lng,
-        })
-
-    return {
-        "startNode": start_node,
-        "endNode": end_node,
-        "totalTimeMinutes": round(best_time, 1),
-        "totalDistanceKm": round(best_dist, 2),
-        "nodeCount": len(best_path),
-        "path": best_path,
-        "itinerary": itinerary,
-        "coordinates": coordinates,
-        "algorithm": "Dijkstra (Weighted Congestion Multiplier)",
-    }
+    `waypoints` are real intermediate positions -- typically places the fleet
+    has actually driven through, taken from ping history -- which is what
+    gives the graph any shape beyond a straight line.
+    """
+    nodes = [
+        RouteNode("origin", origin[0], origin[1], kind="origin"),
+        RouteNode("destination", destination[0], destination[1], kind="destination"),
+    ]
+    nodes.extend(RouteNode(wid, lat, lng) for wid, lat, lng in waypoints)
+    graph = build_graph(nodes, max_edge_km=max_edge_km)
+    return fastest_route(nodes, "origin", "destination", graph)

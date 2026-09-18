@@ -1,69 +1,103 @@
 """
-Incident Orchestrator APIRouter.
+Incident orchestrator API.
+
+Every route is authenticated and scoped to the company that owns the cargo.
+Previously create, advance, read, timeline and SLA were all open, and the
+audit trail's `actor_id` was a free-text request field defaulting to the
+literal "ops" -- so an anonymous caller could drive any carrier's incident to
+ESCROW_RELEASED and the trail would record it as an internal action.
 """
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict, Optional
+
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
-from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
-from .models import IncidentState, Incident
-from .orchestrator import (
-    create_incident,
-    advance,
-    get_incident_timeline,
-    IllegalTransition,
-    IncidentNotFound,
-)
-from .sla import compute_sla
-from .trust import compute_trust_score
-from shared.database import get_db
-from services.core_api.app.auth import get_current_company
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from services.core_api.app.auth import actor_id_of, get_current_company, get_current_principal
 from services.core_api.app.events.producer import event_producer
 from services.core_api.app.models import Shipment
+from shared.database import get_db
+from shared.observability import logger
+
+from .authz import load_incident_for_owner
+from .models import Incident, IncidentState
+from .orchestrator import (
+    IllegalTransition,
+    IncidentNotFound,
+    advance,
+    create_incident,
+    get_incident_timeline,
+)
+from .sla import compute_sla
 
 router = APIRouter(prefix="/api/v1", tags=["orchestrator"])
 
 
 class CreateIncidentRequest(BaseModel):
+    """An incident is always raised against a shipment the caller owns.
+
+    There is no actor_id field: the actor is taken from the verified token.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
     shipment_id: str
-    lat: float
-    lng: float
-    minutes_until_spoilage: Optional[float] = None
-    actor_id: Optional[str] = "system"
+    lat: float = Field(..., ge=-90, le=90)
+    lng: float = Field(..., ge=-180, le=180)
+    minutes_until_spoilage: Optional[float] = Field(None, ge=0)
 
 
 class AdvanceIncidentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     new_state: IncidentState
-    actor_id: str = "ops"
     metadata: Optional[Dict[str, Any]] = None
 
 
-class TrustScoreRequest(BaseModel):
-    completedRescues: int = Field(0, ge=0)
-    acceptanceRate: float = Field(1.0, ge=0.0, le=1.0)
-    disputeCount: int = Field(0, ge=0)
+def _incident_view(incident: Incident, shipment: Optional[Shipment] = None) -> dict:
+    payload = {
+        "id": incident.id,
+        "shipmentId": incident.shipment_id,
+        "state": incident.state.value,
+        "assignedTruckId": incident.assigned_truck_id,
+        "lat": incident.lat,
+        "lng": incident.lng,
+        "minutesUntilSpoilage": incident.minutes_until_spoilage,
+        "createdAt": incident.created_at.isoformat() if incident.created_at else None,
+        "updatedAt": incident.updated_at.isoformat() if incident.updated_at else None,
+    }
+    if shipment is not None:
+        payload["cargoType"] = shipment.cargo_type
+        payload["requiresRefrigeration"] = shipment.requires_refrigeration
+        payload["requiredMaxTempC"] = shipment.required_max_temp_c
+        payload["isHazmat"] = shipment.is_hazmat
+    return payload
 
 
 @router.post("/incidents", status_code=status.HTTP_201_CREATED)
-async def create_new_incident(req: CreateIncidentRequest, db: AsyncSession = Depends(get_db)):
+async def create_new_incident(
+    req: CreateIncidentRequest,
+    principal: Dict[str, Any] = Depends(get_current_principal),
+    db: AsyncSession = Depends(get_db),
+):
+    shipment = await db.get(Shipment, req.shipment_id)
+    if not shipment or shipment.owner_company_id != principal.get("company_id"):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Shipment not found or does not belong to your company",
+        )
+
     incident = await create_incident(
         session=db,
         shipment_id=req.shipment_id,
         lat=req.lat,
         lng=req.lng,
         minutes_until_spoilage=req.minutes_until_spoilage,
-        actor_id=req.actor_id,
+        actor_id=actor_id_of(principal),
         event_publisher=event_producer.publish,
     )
-    return {
-        "id": incident.id,
-        "shipmentId": incident.shipment_id,
-        "state": incident.state.value,
-        "lat": incident.lat,
-        "lng": incident.lng,
-        "minutesUntilSpoilage": incident.minutes_until_spoilage,
-        "createdAt": incident.created_at.isoformat() if incident.created_at else None,
-    }
+    return _incident_view(incident, shipment)
 
 
 @router.get("/incidents")
@@ -81,67 +115,74 @@ async def list_company_incidents(
         .order_by(Incident.created_at.desc())
         .limit(limit)
     )
-    return [
-        {
-            "id": incident.id,
-            "shipmentId": incident.shipment_id,
-            "cargoType": shipment.cargo_type,
-            "state": incident.state.value,
-            "assignedTruckId": incident.assigned_truck_id,
-            "lat": incident.lat,
-            "lng": incident.lng,
-            "minutesUntilSpoilage": incident.minutes_until_spoilage,
-            "createdAt": incident.created_at.isoformat() if incident.created_at else None,
-            "updatedAt": incident.updated_at.isoformat() if incident.updated_at else None,
-        }
-        for incident, shipment in result.all()
-    ]
+    return [_incident_view(incident, shipment) for incident, shipment in result.all()]
+
+
+@router.get("/incidents/{id}")
+async def get_incident_by_id(
+    id: str,
+    principal: Dict[str, Any] = Depends(get_current_principal),
+    db: AsyncSession = Depends(get_db),
+):
+    incident, shipment = await load_incident_for_owner(id, principal, db)
+    return _incident_view(incident, shipment)
 
 
 @router.post("/incidents/{id}/advance")
 async def advance_incident_state(
-    id: str, req: AdvanceIncidentRequest, db: AsyncSession = Depends(get_db)
+    id: str,
+    req: AdvanceIncidentRequest,
+    principal: Dict[str, Any] = Depends(get_current_principal),
+    db: AsyncSession = Depends(get_db),
 ):
+    """Move an incident to its next lifecycle state.
+
+    RESCUE_ACCEPTED is deliberately not reachable here. Binding a rescue
+    requires both the stranded owner and the helping carrier to agree, which
+    is handled by the offer handshake -- a single call from one party must
+    never be able to assign another company's truck to a job.
+    """
+    incident, shipment = await load_incident_for_owner(id, principal, db)
+
+    if req.new_state == IncidentState.RESCUE_ACCEPTED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "RESCUE_ACCEPTED is reached by the two-way offer handshake, not by a "
+                "direct state change. Use the rescue offer endpoints."
+            ),
+        )
+
     try:
         incident = await advance(
             session=db,
             incident_id=id,
             new_state=req.new_state,
-            actor_id=req.actor_id,
+            actor_id=actor_id_of(principal),
             metadata=req.metadata,
             event_publisher=event_producer.publish,
         )
-        return {
-            "id": incident.id,
-            "state": incident.state.value,
-            "assignedTruckId": incident.assigned_truck_id,
-            "updatedAt": incident.updated_at.isoformat() if incident.updated_at else None,
-        }
     except IllegalTransition as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except IncidentNotFound:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
 
-
-@router.get("/incidents/{id}")
-async def get_incident_by_id(id: str, db: AsyncSession = Depends(get_db)):
-    incident = await db.get(Incident, id)
-    if not incident:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
-    return {
-        "id": incident.id,
-        "shipmentId": incident.shipment_id,
-        "state": incident.state.value,
-        "assignedTruckId": incident.assigned_truck_id,
-        "lat": incident.lat,
-        "lng": incident.lng,
-        "minutesUntilSpoilage": incident.minutes_until_spoilage,
-        "createdAt": incident.created_at.isoformat() if incident.created_at else None,
-    }
+    logger.info(
+        "incident_advanced_via_api",
+        incident_id=id,
+        new_state=req.new_state.value,
+        actor=actor_id_of(principal),
+    )
+    return _incident_view(incident, shipment)
 
 
 @router.get("/incidents/{id}/timeline")
-async def get_timeline(id: str, db: AsyncSession = Depends(get_db)):
+async def get_timeline(
+    id: str,
+    principal: Dict[str, Any] = Depends(get_current_principal),
+    db: AsyncSession = Depends(get_db),
+):
+    await load_incident_for_owner(id, principal, db)
     events = await get_incident_timeline(db, id)
     return [
         {
@@ -159,15 +200,11 @@ async def get_timeline(id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/incidents/{id}/sla")
-async def get_sla_metrics(id: str, db: AsyncSession = Depends(get_db)):
+async def get_sla_metrics(
+    id: str,
+    principal: Dict[str, Any] = Depends(get_current_principal),
+    db: AsyncSession = Depends(get_db),
+):
+    await load_incident_for_owner(id, principal, db)
     events = await get_incident_timeline(db, id)
-    events_dicts = [
-        {"type": e.type, "created_at": e.created_at}
-        for e in events
-    ]
-    return compute_sla(events_dicts)
-
-
-@router.post("/trust-score")
-async def calculate_trust(stats: TrustScoreRequest):
-    return compute_trust_score(stats.model_dump())
+    return compute_sla([{"type": e.type, "created_at": e.created_at} for e in events])

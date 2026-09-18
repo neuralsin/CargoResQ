@@ -1,284 +1,135 @@
 <?xml version="1.0" encoding="utf-8"?>
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="@color/uber_canvas"
-    android:fillViewport="true">
+    android:background="@color/canvas">
 
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical"
-        android:padding="20dp">
+        android:paddingStart="16dp"
+        android:paddingEnd="16dp"
+        android:paddingTop="20dp"
+        android:paddingBottom="110dp">
 
-        <!-- Account Profile Header (1:1 Uber Account) -->
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:gravity="center_vertical"
-            android:orientation="horizontal">
-
-            <LinearLayout
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:orientation="vertical">
-
-                <TextView
-                    android:id="@+id/txt_account_name"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Rajesh Kumar"
-                    android:textColor="@color/uber_pure_black"
-                    android:textSize="28sp"
-                    android:textStyle="bold" />
-
-                <!-- Rating Pill -->
-                <LinearLayout
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="6dp"
-                    android:background="@drawable/bg_pill_demo"
-                    android:gravity="center"
-                    android:paddingStart="10dp"
-                    android:paddingTop="4dp"
-                    android:paddingEnd="10dp"
-                    android:paddingBottom="4dp">
-
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="★ 4.96"
-                        android:textColor="@color/uber_teal"
-                        android:textSize="12sp"
-                        android:textStyle="bold" />
-
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:layout_marginStart="6dp"
-                        android:text="• Verified Carrier Driver"
-                        android:textColor="@color/uber_gray_muted"
-                        android:textSize="11sp" />
-                </LinearLayout>
-
-            </LinearLayout>
-
-            <!-- Avatar -->
-            <FrameLayout
-                android:layout_width="56dp"
-                android:layout_height="56dp"
-                android:background="@drawable/bg_pill_button">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_gravity="center"
-                    android:text="RK"
-                    android:textColor="@color/uber_white"
-                    android:textSize="18sp"
-                    android:textStyle="bold" />
-            </FrameLayout>
-
-        </LinearLayout>
-
-        <!-- 3-Action Quick Grid (1:1 with Uber Account) -->
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="24dp"
-            android:orientation="horizontal"
-            android:weightSum="3">
-
-            <!-- Safety -->
-            <LinearLayout
-                android:id="@+id/btn_action_safety"
-                android:layout_width="0dp"
-                android:layout_height="90dp"
-                android:layout_marginEnd="4dp"
-                android:layout_weight="1"
-                android:background="@drawable/bg_card"
-                android:clickable="true"
-                android:focusable="true"
-                android:gravity="center"
-                android:orientation="vertical">
-
-                <ImageView
-                    android:layout_width="24dp"
-                    android:layout_height="24dp"
-                    android:src="@drawable/ic_sos"
-                    app:tint="@color/uber_black" />
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="6dp"
-                    android:text="Safety Hub"
-                    android:textColor="@color/uber_black"
-                    android:textSize="12sp"
-                    android:textStyle="bold" />
-            </LinearLayout>
-
-            <!-- Earnings -->
-            <LinearLayout
-                android:id="@+id/btn_action_wallet"
-                android:layout_width="0dp"
-                android:layout_height="90dp"
-                android:layout_marginStart="4dp"
-                android:layout_marginEnd="4dp"
-                android:layout_weight="1"
-                android:background="@drawable/bg_card"
-                android:clickable="true"
-                android:focusable="true"
-                android:gravity="center"
-                android:orientation="vertical">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="₹"
-                    android:textColor="@color/uber_teal"
-                    android:textSize="22sp"
-                    android:textStyle="bold" />
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="4dp"
-                    android:text="₹1,24,800"
-                    android:textColor="@color/uber_black"
-                    android:textSize="12sp"
-                    android:textStyle="bold" />
-            </LinearLayout>
-
-            <!-- Help -->
-            <LinearLayout
-                android:id="@+id/btn_action_help"
-                android:layout_width="0dp"
-                android:layout_height="90dp"
-                android:layout_marginStart="4dp"
-                android:layout_weight="1"
-                android:background="@drawable/bg_card"
-                android:clickable="true"
-                android:focusable="true"
-                android:gravity="center"
-                android:orientation="vertical">
-
-                <ImageView
-                    android:layout_width="24dp"
-                    android:layout_height="24dp"
-                    android:src="@drawable/ic_activity"
-                    app:tint="@color/uber_black" />
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="6dp"
-                    android:text="NHAI 1033"
-                    android:textColor="@color/uber_black"
-                    android:textSize="12sp"
-                    android:textStyle="bold" />
-            </LinearLayout>
-        </LinearLayout>
-
-        <!-- Assigned Truck Card -->
         <TextView
+            android:id="@+id/text_account_name"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="24dp"
-            android:text="Assigned Rescue Vehicle"
-            android:textColor="@color/uber_black"
-            android:textSize="17sp"
+            android:text="Driver"
+            android:textColor="@color/ink"
+            android:textSize="26sp"
             android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/text_account_email"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:textColor="@color/muted"
+            android:textSize="13sp" />
+
+        <TextView style="@style/CargoText.Eyebrow"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="ASSIGNED VEHICLE"
+            android:layout_marginTop="24dp"
+            android:layout_marginBottom="8dp" />
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="10dp"
-            android:background="@drawable/bg_card"
             android:orientation="vertical"
+            android:background="@drawable/bg_card"
             android:padding="16dp">
 
-            <LinearLayout
+            <TextView
+                android:id="@+id/text_account_truck"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:gravity="center_vertical"
-                android:orientation="horizontal">
-
-                <LinearLayout
-                    android:layout_width="0dp"
-                    android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:orientation="vertical">
-
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="MH-12-TX-9042"
-                        android:textColor="@color/uber_black"
-                        android:textSize="18sp"
-                        android:textStyle="bold" />
-
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="2dp"
-                        android:text="Tata Ultra Reefer • -20.0°C Certified"
-                        android:textColor="@color/uber_gray_muted"
-                        android:textSize="12sp" />
-                </LinearLayout>
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:background="@drawable/bg_pill_demo"
-                    android:paddingStart="10dp"
-                    android:paddingTop="4dp"
-                    android:paddingEnd="10dp"
-                    android:paddingBottom="4dp"
-                    android:text="NOMINAL"
-                    android:textColor="@color/uber_teal"
-                    android:textSize="10sp"
-                    android:textStyle="bold" />
-            </LinearLayout>
-
-            <View
-                android:layout_width="match_parent"
-                android:layout_height="1dp"
-                android:layout_marginTop="12dp"
-                android:layout_marginBottom="12dp"
-                android:background="@color/uber_card_stroke" />
+                android:text="No truck assigned"
+                android:textColor="@color/ink"
+                android:textSize="16sp"
+                android:textStyle="bold" />
 
             <TextView
-                android:layout_width="wrap_content"
+                android:id="@+id/text_account_truck_detail"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Carrier: Apex Cold Logistics (SLA 99.4%)"
-                android:textColor="@color/uber_gray_muted"
+                android:layout_marginTop="4dp"
+                android:textColor="@color/muted"
                 android:textSize="12sp" />
         </LinearLayout>
 
-        <!-- Sign out button -->
-        <LinearLayout
-            android:id="@+id/btn_sign_out"
-            android:layout_width="match_parent"
-            android:layout_height="48dp"
+        <TextView style="@style/CargoText.Eyebrow"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="POSITION SHARING"
             android:layout_marginTop="24dp"
-            android:background="@drawable/bg_pill_button"
-            android:clickable="true"
-            android:focusable="true"
-            android:gravity="center"
-            android:orientation="horizontal">
+            android:layout_marginBottom="8dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/bg_card"
+            android:padding="16dp">
+
+            <!-- Said plainly. The driver is entitled to know exactly what is
+                 collected and who can see it. -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="While you are on duty, this app sends your position, speed and battery level to your own company. Your dispatcher sees it on their map."
+                android:textColor="@color/ink"
+                android:textSize="13sp" />
 
             <TextView
-                android:layout_width="wrap_content"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Sign Out"
-                android:textColor="@color/uber_white"
-                android:textSize="13sp"
+                android:layout_marginTop="8dp"
+                android:text="Other companies never see your position, except while one of their loads is being rescued by your truck, and then only where you are."
+                android:textColor="@color/muted"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/text_account_telemetry"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:textColor="@color/teal"
+                android:textSize="12sp"
                 android:textStyle="bold" />
         </LinearLayout>
 
-    </LinearLayout>
+        <TextView style="@style/CargoText.Eyebrow"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="SERVER"
+            android:layout_marginTop="24dp"
+            android:layout_marginBottom="8dp" />
 
+        <TextView
+            android:id="@+id/text_account_server"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="@drawable/bg_card_soft"
+            android:padding="14dp"
+            android:textColor="@color/muted"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/btn_sign_out"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginTop="28dp"
+            android:background="@drawable/bg_pill_outline"
+            android:text="Sign out"
+            android:textAllCaps="false"
+            android:textColor="@color/red"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:stateListAnimator="@null" />
+    </LinearLayout>
 </ScrollView>
