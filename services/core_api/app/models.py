@@ -20,8 +20,7 @@ from sqlalchemy import (
 )
 
 
-class Base(DeclarativeBase):
-    pass
+from shared.database import Base
 
 
 class TruckStatus(str, enum.Enum):

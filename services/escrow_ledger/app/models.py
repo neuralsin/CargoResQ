@@ -8,8 +8,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import String, Float, DateTime, ForeignKey, func
 
 
-class Base(DeclarativeBase):
-    pass
+from shared.database import Base
 
 
 class Escrow(Base):

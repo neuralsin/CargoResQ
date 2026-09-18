@@ -1,6 +1,7 @@
 """
 Observability: Structured Logging & Prometheus Metrics (Phase 9).
 """
+import logging
 import structlog
 from prometheus_client import Histogram, Counter, Gauge, generate_latest, CONTENT_TYPE_LATEST
 from fastapi import Response
@@ -16,7 +17,7 @@ def configure_logging():
             structlog.processors.format_exc_info,
             structlog.processors.JSONRenderer(),
         ],
-        wrapper_class=structlog.make_filtering_bound_logger(structlog.INFO),
+        wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
         context_class=dict,
         logger_factory=structlog.PrintLoggerFactory(),
         cache_logger_on_first_use=True,

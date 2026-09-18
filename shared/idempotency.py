@@ -2,25 +2,22 @@
 Idempotent Event Processing (Phase 18.1).
 Guarantees deduplication across Kafka at-least-once deliveries and repeated client requests.
 """
+from datetime import datetime
 from typing import Callable, Awaitable, Any
-from sqlalchemy import text
+from sqlalchemy import text, String, DateTime, func
+from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.ext.asyncio import AsyncSession
+from shared.database import Base
 
 
-IDEMPOTENCY_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS processed_events (
-    event_id VARCHAR(128) NOT NULL,
-    consumer VARCHAR(128) NOT NULL,
-    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (event_id, consumer)
-);
-"""
+class ProcessedEvent(Base):
+    __tablename__ = "processed_events"
 
-
-async def init_idempotency_table(session: AsyncSession) -> None:
-    """Ensure the processed_events table exists."""
-    await session.execute(text(IDEMPOTENCY_TABLE_SQL))
-    await session.commit()
+    event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    consumer: Mapped[str] = mapped_column(String(128), primary_key=True)
+    processed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 async def process_once(

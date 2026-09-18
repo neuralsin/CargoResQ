@@ -21,7 +21,7 @@ class EventProducer:
         self._local_subscribers: List[Callable[[str, Dict[str, Any]], Awaitable[None]]] = []
 
     async def start(self):
-        if AIOKafkaProducer:
+        if self.bootstrap_servers and AIOKafkaProducer:
             try:
                 self._producer = AIOKafkaProducer(
                     bootstrap_servers=self.bootstrap_servers,
@@ -33,7 +33,7 @@ class EventProducer:
                 logger.warn("kafka_unavailable_running_in_memory", error=str(e))
                 self._producer = None
         else:
-            logger.info("aiokafka_not_installed_using_local_bus")
+            logger.info("running_in_memory_event_bus")
 
     def register_local_subscriber(
         self, callback: Callable[[str, Dict[str, Any]], Awaitable[None]]
