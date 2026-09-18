@@ -3,6 +3,8 @@ package com.cargoresq.driver.api
 import com.cargoresq.driver.model.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -31,10 +33,19 @@ object CargoResQApi {
     private val JSON = "application/json; charset=utf-8".toMediaType()
     private val FORM = "application/x-www-form-urlencoded".toMediaType()
 
+    fun sanitizeBaseUrl(raw: String): String {
+        var s = raw.trim()
+        if (s.isEmpty()) return "http://10.0.2.2:8000"
+        if (!s.startsWith("http://", ignoreCase = true) && !s.startsWith("https://", ignoreCase = true)) {
+            s = "http://$s"
+        }
+        return s.trimEnd('/')
+    }
+
     @Volatile
     var baseUrl: String = "http://10.0.2.2:8000"
         set(value) {
-            field = value.trim().trimEnd('/')
+            field = sanitizeBaseUrl(value)
         }
 
     private val client: OkHttpClient by lazy {
@@ -54,6 +65,14 @@ object CargoResQApi {
     ) : Exception(message)
 
     // -- plumbing ---------------------------------------------------------
+
+    private fun buildUrl(path: String): HttpUrl {
+        val cleanBase = sanitizeBaseUrl(baseUrl)
+        val cleanPath = if (path.startsWith("/")) path else "/$path"
+        val full = cleanBase + cleanPath
+        return full.toHttpUrlOrNull()
+            ?: throw IllegalArgumentException("Invalid server address: $full")
+    }
 
     private suspend fun execute(request: Request): Result<String> = withContext(Dispatchers.IO) {
         try {
@@ -75,6 +94,8 @@ object CargoResQApi {
                     isNetwork = true,
                 )
             )
+        } catch (e: IllegalArgumentException) {
+            Result.failure(ApiException(e.message ?: "Invalid server URL"))
         } catch (e: Exception) {
             Result.failure(ApiException(e.message ?: "Unexpected error"))
         }
@@ -103,33 +124,40 @@ object CargoResQApi {
     }
 
     private fun get(path: String, token: String?): Request =
-        Request.Builder().url(baseUrl + path).apply {
+        Request.Builder().url(buildUrl(path)).apply {
             token?.let { header("Authorization", "Bearer $it") }
         }.get().build()
 
     private fun post(path: String, token: String?, body: JSONObject?): Request =
-        Request.Builder().url(baseUrl + path).apply {
+        Request.Builder().url(buildUrl(path)).apply {
             token?.let { header("Authorization", "Bearer $it") }
         }.post((body?.toString() ?: "{}").toRequestBody(JSON)).build()
 
     private fun formPost(path: String, form: String): Request =
-        Request.Builder().url(baseUrl + path).post(form.toRequestBody(FORM)).build()
+        Request.Builder().url(buildUrl(path)).post(form.toRequestBody(FORM)).build()
 
     // -- auth -------------------------------------------------------------
 
-    suspend fun login(email: String, password: String): Result<DriverSession> {
+    suspend fun login(email: String, password: String): Result<DriverSession> = runCatching {
         val form = "username=" + enc(email) + "&password=" + enc(password)
-        return execute(formPost("/api/v1/driver/login", form)).mapCatching { body ->
-            val json = JSONObject(body)
-            DriverSession(
-                token = json.getString("access_token"),
-                driverId = json.getString("driver_id"),
-                driverName = json.getString("driver_name"),
-                companyId = json.getString("company_id"),
-                email = email,
-            )
+        formPost("/api/v1/driver/login", form)
+    }.fold(
+        onSuccess = { req ->
+            execute(req).mapCatching { body ->
+                val json = JSONObject(body)
+                DriverSession(
+                    token = json.getString("access_token"),
+                    driverId = json.getString("driver_id"),
+                    driverName = json.getString("driver_name"),
+                    companyId = json.getString("company_id"),
+                    email = email,
+                )
+            }
+        },
+        onFailure = { err ->
+            Result.failure(ApiException(err.message ?: "Invalid server address"))
         }
-    }
+    )
 
     suspend fun profile(token: String): Result<DriverProfile> =
         execute(get("/api/v1/driver/me", token)).mapCatching { body ->

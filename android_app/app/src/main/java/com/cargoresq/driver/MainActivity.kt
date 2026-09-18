@@ -23,6 +23,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import com.cargoresq.driver.api.CargoResQApi
 import com.cargoresq.driver.model.*
 import com.cargoresq.driver.telemetry.TelemetryService
@@ -212,7 +213,21 @@ class MainActivity : AppCompatActivity() {
         val button = view.findViewById<Button>(R.id.btn_sign_in)
         val progress = view.findViewById<ProgressBar>(R.id.progress_auth)
 
-        baseUrlInput.setText(Session.baseUrl)
+        val presetUsb = view.findViewById<Button>(R.id.btn_preset_usb)
+        val presetWifi = view.findViewById<Button>(R.id.btn_preset_wifi)
+        val presetEmu = view.findViewById<Button>(R.id.btn_preset_emu)
+
+        presetUsb?.setOnClickListener { baseUrlInput.setText("http://127.0.0.1:8000") }
+        presetWifi?.setOnClickListener { baseUrlInput.setText("http://172.18.228.204:8000") }
+        presetEmu?.setOnClickListener { baseUrlInput.setText("http://10.0.2.2:8000") }
+
+        // If on real hardware and still pointing at emulator IP, default to Wi-Fi LAN
+        val initialUrl = if (Session.baseUrl == "http://10.0.2.2:8000" && !android.os.Build.FINGERPRINT.startsWith("generic")) {
+            "http://172.18.228.204:8000"
+        } else {
+            Session.baseUrl
+        }
+        baseUrlInput.setText(initialUrl)
 
         button.setOnClickListener {
             val email = emailInput.text.toString().trim()
@@ -223,7 +238,20 @@ class MainActivity : AppCompatActivity() {
                 return@setOnClickListener
             }
 
-            Session.baseUrl = baseUrlInput.text.toString().trim()
+            val rawUrl = baseUrlInput.text.toString().trim()
+            if (rawUrl.isEmpty()) {
+                errorText.text = "Enter the server address (e.g. http://172.18.228.204:8000)."
+                errorText.visibility = View.VISIBLE
+                return@setOnClickListener
+            }
+            val cleanUrl = CargoResQApi.sanitizeBaseUrl(rawUrl)
+            if (cleanUrl.toHttpUrlOrNull() == null) {
+                errorText.text = "Invalid server address: $rawUrl. Include valid host and port."
+                errorText.visibility = View.VISIBLE
+                return@setOnClickListener
+            }
+
+            Session.baseUrl = cleanUrl
             errorText.visibility = View.GONE
             button.isEnabled = false
             progress.visibility = View.VISIBLE
@@ -237,10 +265,14 @@ class MainActivity : AppCompatActivity() {
                     Session.save(session)
                     showApp()
                 }.onFailure { error ->
-                    // A real failure, shown as one. The previous build
-                    // returned a fabricated session here and let the driver
-                    // believe they were signed in.
-                    errorText.text = error.message ?: "Sign in failed."
+                    val tip = if (cleanUrl.contains("10.0.2.2")) {
+                        "\nTip: 10.0.2.2 only works inside Android Emulator. On a phone, tap 'Wi-Fi' or 'USB' above."
+                    } else if (cleanUrl.contains("127.0.0.1") || cleanUrl.contains("localhost")) {
+                        "\nTip: For USB connection, run connect_phone_usb.bat (adb reverse tcp:8000 tcp:8000) on your PC."
+                    } else {
+                        "\nTip: Ensure your PC backend is running and both devices share the same network."
+                    }
+                    errorText.text = (error.message ?: "Sign in failed.") + tip
                     errorText.visibility = View.VISIBLE
                 }
             }

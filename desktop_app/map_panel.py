@@ -139,7 +139,8 @@ class MapPanel(ctk.CTkFrame):
         if lat is None or lng is None:
             return
         fill, text_color = MARKER_COLORS.get(kind, MARKER_COLORS["own_truck"])
-        click_cb = self._on_marker_click
+        cb = self._on_marker_click
+        cmd = (lambda _m, k=key, fn=cb: fn(k) if fn else None) if cb is not None else None
         try:
             marker = self.map_view.set_marker(
                 float(lat),
@@ -148,16 +149,69 @@ class MapPanel(ctk.CTkFrame):
                 marker_color_circle=text_color,
                 marker_color_outside=fill,
                 text_color=COLORS["ink"],
-                command=(
-                    (lambda _m, k=key: click_cb(k))
-                    if click_cb is not None
-                    else None
-                ),
+                command=cmd,
             )
         except Exception:
             return
         setattr(marker, "cargoresq_detail", detail)
+        setattr(marker, "_spec", (lat, lng, text, kind))
         self._markers[key] = marker
+
+    def sync_markers(self, specs: Dict[str, Dict[str, Any]]) -> None:
+        """Incrementally sync markers without wiping and redrawing."""
+        obsolete_keys = [k for k in self._markers if k not in specs]
+        for k in obsolete_keys:
+            try:
+                self._markers[k].delete()
+            except Exception:
+                pass
+            del self._markers[k]
+
+        for key, spec in specs.items():
+            lat = spec.get("lat")
+            lng = spec.get("lng")
+            if lat is None or lng is None:
+                continue
+            text = spec.get("text", "")
+            kind = spec.get("kind", "own_truck")
+            detail = spec.get("detail", "")
+
+            if key in self._markers:
+                marker = self._markers[key]
+                cur_spec = getattr(marker, "_spec", None)
+                if cur_spec == (lat, lng, text, kind):
+                    continue
+                try:
+                    marker.set_position(float(lat), float(lng))
+                    marker.set_text(text)
+                    setattr(marker, "_spec", (lat, lng, text, kind))
+                    setattr(marker, "cargoresq_detail", detail)
+                    continue
+                except Exception:
+                    try:
+                        marker.delete()
+                    except Exception:
+                        pass
+                    del self._markers[key]
+
+            fill, text_color = MARKER_COLORS.get(kind, MARKER_COLORS["own_truck"])
+            cb = self._on_marker_click
+            cmd = (lambda _m, k=key, fn=cb: fn(k) if fn else None) if cb is not None else None
+            try:
+                marker = self.map_view.set_marker(
+                    float(lat),
+                    float(lng),
+                    text=text,
+                    marker_color_circle=text_color,
+                    marker_color_outside=fill,
+                    text_color=COLORS["ink"],
+                    command=cmd,
+                )
+                setattr(marker, "_spec", (lat, lng, text, kind))
+                setattr(marker, "cargoresq_detail", detail)
+                self._markers[key] = marker
+            except Exception:
+                pass
 
     def add_path(self, points: Iterable[Tuple[float, float]], color: str = COLORS["teal"]) -> None:
         pts = [(float(a), float(b)) for a, b in points if a is not None and b is not None]

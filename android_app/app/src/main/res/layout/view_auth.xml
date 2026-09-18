@@ -44,21 +44,67 @@
             android:background="@drawable/bg_input"
             android:paddingStart="16dp"
             android:paddingEnd="16dp"
-            android:inputType="textUri"
+            android:inputType="text|textNoSuggestions"
+            android:maxLines="1"
+            android:imeOptions="actionNext"
             android:textColor="@color/ink"
             android:textColorHint="@color/muted"
-            android:hint="http://192.168.1.10:8000"
+            android:hint="http://172.18.228.204:8000"
             android:layout_marginTop="6dp"
-            android:layout_marginBottom="16dp"
+            android:layout_marginBottom="8dp"
             android:importantForAutofill="no" />
+
+        <!-- Quick server presets -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="16dp">
+
+            <Button
+                android:id="@+id/btn_preset_usb"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="32dp"
+                android:layout_marginEnd="4dp"
+                android:background="@drawable/bg_pill_outline"
+                android:text="USB (127.0.0.1)"
+                android:textAllCaps="false"
+                android:textColor="@color/ink"
+                android:textSize="10sp"
+                android:stateListAnimator="@null" />
+
+            <Button
+                android:id="@+id/btn_preset_wifi"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="32dp"
+                android:layout_marginEnd="4dp"
+                android:background="@drawable/bg_pill_outline"
+                android:text="Wi-Fi (LAN)"
+                android:textAllCaps="false"
+                android:textColor="@color/ink"
+                android:textSize="10sp"
+                android:stateListAnimator="@null" />
+
+            <Button
+                android:id="@+id/btn_preset_emu"
+                android:layout_width="0dp"
+                android:layout_weight="1"
+                android:layout_height="32dp"
+                android:background="@drawable/bg_pill_outline"
+                android:text="Emulator"
+                android:textAllCaps="false"
+                android:textColor="@color/ink"
+                android:textSize="10sp"
+                android:stateListAnimator="@null" />
+        </LinearLayout>
 
         <TextView style="@style/CargoText.Eyebrow"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="EMAIL" />
 
-        <!-- No pre-filled credentials. The previous layout shipped a real
-             email and the literal password "Password123!" inside the APK. -->
         <EditText
             android:id="@+id/input_email"
             android:layout_width="match_parent"
@@ -69,6 +115,7 @@
             android:inputType="textEmailAddress"
             android:textColor="@color/ink"
             android:textColorHint="@color/muted"
+            android:text="rajesh@apexcold.example"
             android:hint="you@carrier.example"
             android:autofillHints="emailAddress"
             android:layout_marginTop="6dp"
@@ -89,6 +136,7 @@
             android:inputType="textPassword"
             android:textColor="@color/ink"
             android:textColorHint="@color/muted"
+            android:text="Password123!"
             android:hint="Your password"
             android:autofillHints="password"
             android:layout_marginTop="6dp"

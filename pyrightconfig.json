@@ -1,11 +1,26 @@
 {
   "pythonVersion": "3.11",
   "pythonPlatform": "Windows",
+  "extraPaths": [
+    "C:\\Users\\shaan\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\site-packages",
+    "c:\\Users\\shaan\\OneDrive\\Documents\\C++\\venv\\Lib\\site-packages",
+    ".",
+    "desktop_app",
+    "services/core_api",
+    "services/matching_engine",
+    "services/pricing_engine",
+    "services/escrow_ledger",
+    "services/realtime_gateway",
+    "services/orchestrator",
+    "services/sos",
+    "services/telemetry"
+  ],
   "executionEnvironments": [
     {
       "root": ".",
       "extraPaths": [
         "C:\\Users\\shaan\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\site-packages",
+        "c:\\Users\\shaan\\OneDrive\\Documents\\C++\\venv\\Lib\\site-packages",
         ".",
         "desktop_app",
         "services/core_api",

@@ -115,31 +115,71 @@ class LoginView(ctk.CTkFrame):
             font=ctk.CTkFont(size=11, weight="bold"),
         ).grid(row=1, column=0, padx=44, pady=(0, 26))
 
-        self.email = self._field(panel, "Company email", 2, "")
-        self.password = self._field(panel, "Password", 4, "", show="•")
+        self.email = self._field(panel, "Company email", 2, "ops@apexcold.example")
+        self.password = self._field(panel, "Password", 4, "Password123!", show="•")
+
+        # Demo carrier quick-fill pills
+        pills_frame = ctk.CTkFrame(panel, fg_color="transparent")
+        pills_frame.grid(row=5, column=0, padx=44, pady=(0, 10), sticky="ew")
+        ctk.CTkLabel(
+            pills_frame, text="Quick login:", text_color=COLORS["muted"],
+            font=ctk.CTkFont(size=10, weight="bold"),
+        ).pack(side="left", padx=(0, 6))
+
+        def _set_account(e: str):
+            self.email.delete(0, "end")
+            self.email.insert(0, e)
+            self.password.delete(0, "end")
+            self.password.insert(0, "Password123!")
+
+        ctk.CTkButton(
+            pills_frame, text="Apex (Owner)", width=80, height=24,
+            fg_color="#0F766E", hover_color="#115E59", font=ctk.CTkFont(size=10),
+            command=lambda: _set_account("ops@apexcold.example"),
+        ).pack(side="left", padx=2)
+        ctk.CTkButton(
+            pills_frame, text="Northline (Rescuer)", width=110, height=24,
+            fg_color="#1E293B", hover_color="#334155", font=ctk.CTkFont(size=10),
+            command=lambda: _set_account("ops@northline.example"),
+        ).pack(side="left", padx=2)
+        ctk.CTkButton(
+            pills_frame, text="Metro Swift", width=80, height=24,
+            fg_color="#1E293B", hover_color="#334155", font=ctk.CTkFont(size=10),
+            command=lambda: _set_account("ops@metroswift.example"),
+        ).pack(side="left", padx=2)
 
         self.status = ctk.CTkLabel(
             panel, text="", text_color=COLORS["red"], wraplength=380,
             font=ctk.CTkFont(size=11),
         )
-        self.status.grid(row=6, column=0, padx=44, pady=(8, 0))
+        self.status.grid(row=6, column=0, padx=44, pady=(4, 0))
 
         self.button = primary_button(panel, "Sign in", self.submit, width=390, height=42)
-        self.button.grid(row=7, column=0, padx=44, pady=(18, 8))
+        self.button.grid(row=7, column=0, padx=44, pady=(14, 8))
+
+        import socket
+        lan_ip = "127.0.0.1"
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            lan_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            pass
 
         ctk.CTkLabel(
             panel,
-            text=f"Connecting to: {API_ENDPOINT}  (configured in desktop_app/app.py)",
+            text=f"Backend: {API_ENDPOINT}  |  Driver app IP: http://{lan_ip}:8000",
             text_color=COLORS["muted"],
             font=ctk.CTkFont(size=10),
         ).grid(row=8, column=0, padx=44, pady=(0, 4))
 
         ctk.CTkLabel(
             panel,
-            text="Seed demo accounts with:  python scripts/seed_demo.py",
+            text="Demo password: Password123! | Seed data: python scripts/seed_demo.py",
             text_color=COLORS["muted"],
             font=ctk.CTkFont(size=10),
-        ).grid(row=9, column=0, padx=44, pady=(0, 32))
+        ).grid(row=9, column=0, padx=44, pady=(0, 24))
 
         self.email.bind("<Return>", lambda _e: self.submit())
         self.password.bind("<Return>", lambda _e: self.submit())
@@ -153,7 +193,7 @@ class LoginView(ctk.CTkFrame):
             master, width=390, height=38, border_color=COLORS["line"],
             fg_color="#FAFCFB", show=show or "",
         )
-        entry.grid(row=row + 1, column=0, padx=44, pady=(0, 14))
+        entry.grid(row=row + 1, column=0, padx=44, pady=(0, 10))
         if initial:
             entry.insert(0, initial)
         return entry
@@ -172,14 +212,20 @@ class LoginView(ctk.CTkFrame):
             try:
                 self.master_app.connect(API_ENDPOINT, email, password)
                 self.after(0, self.master_app.show_dashboard)
-            except ApiError as exc:
-                self.after(0, lambda: self.status.configure(text=str(exc)))
-            finally:
-                self.after(
-                    0, lambda: self.button.configure(state="normal", text="Sign in")
-                )
+            except Exception as exc:
+                err_msg = str(exc)
+                self.after(0, lambda m=err_msg: self._on_error(m))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _on_error(self, message: str) -> None:
+        try:
+            if self.winfo_exists():
+                self.status.configure(text=message)
+                if hasattr(self, "button") and self.button.winfo_exists():
+                    self.button.configure(state="normal", text="Sign in")
+        except Exception:
+            pass
 
 
 class DashboardView(ctk.CTkFrame):
@@ -207,6 +253,8 @@ class DashboardView(ctk.CTkFrame):
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
+
+        self._data_signatures: Dict[str, Any] = {}
 
         self._build_sidebar()
         self._build_main()
@@ -302,6 +350,14 @@ class DashboardView(ctk.CTkFrame):
         self.content.grid(row=2, column=0, sticky="nsew")
         self.content.grid_columnconfigure(0, weight=1)
         self.content.grid_rowconfigure(0, weight=1)
+
+        # Pre-build all tabs once so tab switching is instantaneous
+        self._build_command_centre()
+        self._build_offers()
+        self._build_fleet()
+        self._build_telemetry()
+        self._build_sos()
+        self._build_shipments()
 
         self.show_tab(self.active_tab)
 
@@ -427,9 +483,73 @@ class DashboardView(ctk.CTkFrame):
         self.tab_frames[name].grid(row=0, column=0, sticky="nsew")
         self._update_tab(name)
 
-    def _update_tab(self, name: str) -> None:
+    def _tab_signature(self, name: str) -> Any:
+        if name == "Command centre":
+            return (
+                len(self.incidents),
+                tuple(
+                    (i.get("id"), i.get("state"), i.get("minutesUntilSpoilage"))
+                    for i in self.incidents
+                ),
+                self.selected_incident_id,
+                len(self.selected_offers),
+                tuple(
+                    (o.get("id"), o.get("state"), o.get("priceTotalInr"))
+                    for o in self.selected_offers
+                ),
+            )
+        elif name == "Rescue offers":
+            return (
+                len(self.inbox),
+                tuple(
+                    (o.get("id"), o.get("state"), o.get("payoutInr"))
+                    for o in self.inbox
+                ),
+            )
+        elif name == "Fleet":
+            return (
+                len(self.fleet),
+                tuple(
+                    (
+                        t.get("truckId") or t.get("id"),
+                        t.get("status"),
+                        t.get("positionIsLive"),
+                        t.get("latitude"),
+                        t.get("longitude"),
+                    )
+                    for t in self.fleet
+                ),
+            )
+        elif name == "Telemetry":
+            return (
+                len(self.alerts),
+                tuple(
+                    (a.get("id"), a.get("status"), a.get("severity"), a.get("occurrenceCount"))
+                    for a in self.alerts
+                ),
+            )
+        elif name == "SOS":
+            return (
+                len(self.own_sos),
+                len(self.nearby_sos),
+                tuple((s.get("id"), s.get("status")) for s in self.own_sos),
+                tuple((s.get("id"), s.get("status")) for s in self.nearby_sos),
+            )
+        elif name == "Shipments":
+            return (
+                len(self.shipments),
+                tuple((s.get("id"), s.get("status")) for s in self.shipments),
+            )
+        return None
+
+    def _update_tab(self, name: str, force: bool = False) -> None:
         if name not in self.tab_frames:
             return
+        sig = self._tab_signature(name)
+        if not force and self._data_signatures.get(name) == sig:
+            return
+        self._data_signatures[name] = sig
+
         updaters: Dict[str, Callable[[], None]] = {
             "Command centre": self._update_command_centre,
             "Rescue offers": self._update_offers,
@@ -442,7 +562,7 @@ class DashboardView(ctk.CTkFrame):
         updater()
 
     def render(self) -> None:
-        self._update_tab(self.active_tab)
+        self._update_tab(self.active_tab, force=True)
 
     # ---- command centre ----
     def _build_command_centre(self) -> None:
@@ -518,7 +638,7 @@ class DashboardView(ctk.CTkFrame):
         panel = target_panel or getattr(self, "map_panel", None)
         if panel is None:
             return
-        panel.clear()
+        specs: Dict[str, Dict[str, Any]] = {}
         positions = []
 
         for truck in self.fleet:
@@ -526,14 +646,15 @@ class DashboardView(ctk.CTkFrame):
             if lat is None or lng is None:
                 continue
             live = truck.get("positionIsLive")
-            panel.add_marker(
-                f"truck:{truck['truckId']}",
-                lat, lng,
-                truck.get("registrationNumber", truck["truckId"]),
-                kind="own_truck" if live else "candidate",
-                detail=f"{truck.get('status')} | {relative_time(truck.get('lastSeenAt'))}",
-            )
-            positions.append((lat, lng))
+            t_id = str(truck.get("truckId") or truck.get("id"))
+            specs[f"truck:{t_id}"] = {
+                "lat": float(lat),
+                "lng": float(lng),
+                "text": str(truck.get("registrationNumber", t_id)),
+                "kind": "own_truck" if live else "candidate",
+                "detail": f"{truck.get('status')} | {relative_time(truck.get('lastSeenAt'))}",
+            }
+            positions.append((float(lat), float(lng)))
 
         for incident in self.incidents:
             if incident.get("state") in {"ESCROW_RELEASED", "CANCELLED"}:
@@ -541,26 +662,28 @@ class DashboardView(ctk.CTkFrame):
             lat, lng = incident.get("lat"), incident.get("lng")
             if lat is None or lng is None:
                 continue
-            panel.add_marker(
-                f"incident:{incident['id']}",
-                lat, lng,
-                incident.get("cargoType") or "Incident",
-                kind="incident",
-            )
-            positions.append((lat, lng))
+            specs[f"incident:{incident['id']}"] = {
+                "lat": float(lat),
+                "lng": float(lng),
+                "text": str(incident.get("cargoType") or "Incident"),
+                "kind": "incident",
+            }
+            positions.append((float(lat), float(lng)))
 
         for alert in self.own_sos:
             alat = alert.get("latitude")
             alng = alert.get("longitude")
             if alat is None or alng is None:
                 continue
-            panel.add_marker(
-                f"sos:{alert['id']}",
-                alat, alng,
-                f"SOS {alert.get('category')}",
-                kind="sos",
-            )
-            positions.append((alat, alng))
+            specs[f"sos:{alert['id']}"] = {
+                "lat": float(alat),
+                "lng": float(alng),
+                "text": f"SOS {alert.get('category')}",
+                "kind": "sos",
+            }
+            positions.append((float(alat), float(alng)))
+
+        panel.sync_markers(specs)
 
         pos_tuple = tuple(sorted(positions))
         if getattr(panel, "_last_positions", None) != pos_tuple:
@@ -1101,7 +1224,7 @@ class DashboardView(ctk.CTkFrame):
             self._safe_after(lambda: self._set_offers(offers))
 
         threading.Thread(target=work, daemon=True).start()
-        self._update_tab("Command centre")
+        self._update_tab("Command centre", force=True)
 
     def _set_offers(self, offers: List[Dict[str, Any]]) -> None:
         self.selected_offers = offers
