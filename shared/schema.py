@@ -37,7 +37,7 @@ def alembic_config() -> Config:
     return cfg
 
 
-def head_revision() -> str:
+def head_revision() -> Optional[str]:
     return ScriptDirectory.from_config(alembic_config()).get_current_head()
 
 

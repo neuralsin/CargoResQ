@@ -28,7 +28,7 @@ class EventProducer:
     def __init__(self, bootstrap_servers: Optional[str] = None) -> None:
         self.bootstrap_servers = bootstrap_servers
         self._producer = None
-        self._local_subscribers: List[Callable[[str, Dict[str, Any]], Awaitable[None]]] = []
+        self._local_subscribers: List[Callable[[str, Dict[str, Any]], Coroutine[Any, Any, None]]] = []
         # Tasks are retained until they finish. Without a strong reference a
         # bare asyncio.create_task is garbage-collectable mid-flight, and any
         # exception it raises is swallowed.

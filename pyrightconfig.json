@@ -4,7 +4,6 @@
   "executionEnvironments": [
     {
       "root": ".",
-      "pythonPath": "C:\\Users\\shaan\\AppData\\Local\\Programs\\Python\\Python311\\python.exe",
       "extraPaths": [
         "C:\\Users\\shaan\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\site-packages",
         ".",

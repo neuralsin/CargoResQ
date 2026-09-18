@@ -1038,8 +1038,9 @@ class DashboardView(ctk.CTkFrame):
                 work()
                 self.after(0, lambda: self.master_app.set_status(success))
                 self.after(0, self.refresh)
-                if self.selected_incident_id:
-                    self.after(0, lambda: self.select_incident(self.selected_incident_id))
+                current_id = self.selected_incident_id
+                if current_id:
+                    self.after(0, lambda: self.select_incident(current_id))
             except ApiError as exc:
                 self.after(0, lambda: messagebox.showerror("CargoResQ", str(exc)))
 
