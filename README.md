@@ -166,17 +166,27 @@ CargoResQ uses a clean hexagonal architecture mounted as a unified, high-perform
 
 ## 📸 Screenshots Showcase
 
-| Desktop Operations Console | Live Radar & Fleet Tracking |
-|:---:|:---:|
-| ![Desktop Console](screenshots/desktop_02_command_centre.png) | ![Fleet Tracking](screenshots/desktop_04_fleet_tracking.png) |
+### 🖥️ Desktop Operations Console — Command Centre & Live Highway Radar
+> *Live OpenStreetMap vector rendering of fleet positions across NH48/NH44, active breakdown beacons, incident queue with time-to-spoilage meters, and fleet telemetry status.*
 
-| Rescue Offers & Two-Way Handshake | Emergency Transponder & SOS |
-|:---:|:---:|
-| ![Rescue Offers](screenshots/desktop_03_rescue_offers.png) | ![SOS Emergency](screenshots/desktop_06_sos_emergency.png) |
+<p align="center">
+  <img src="screenshots/desktop_02_command_centre.png" alt="CargoResQ Desktop Operations Console - Command Centre" width="100%" />
+</p>
 
-| Android Driver Companion | Breakdown SOS & Emergency Mode |
+### 📱 Native Android Driver Companion — In-Transit Telemetry & Emergency Transponder
+> *Left: Active driver telemetry view with background GPS sharing, live cargo status (insulin/vaccines), and time-to-risk countdown. Right: 1-tap emergency transponder with 112/108 calling shortcuts and breakdown categorization.*
+
+<p align="center">
+  <img src="screenshots/mobile_02_driver_home.png" alt="CargoResQ Driver Home & Telemetry Screen" width="46%" />
+  &nbsp; &nbsp; &nbsp; &nbsp;
+  <img src="screenshots/mobile_03_breakdown_sos.png" alt="CargoResQ Breakdown SOS & Emergency Dialer" width="46%" />
+</p>
+
+### 📊 Additional Operations & Settlement Views
+
+| Rescue Offers & Two-Way Handshake | Fleet Telemetry & Temperature Monitor |
 |:---:|:---:|
-| ![Driver Home](screenshots/mobile_02_driver_home.png) | ![Driver SOS](screenshots/mobile_03_breakdown_sos.png) |
+| ![Rescue Offers](screenshots/desktop_03_rescue_offers.png) | ![Fleet Tracking](screenshots/desktop_04_fleet_tracking.png) |
 
 ---
 
