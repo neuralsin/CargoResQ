@@ -214,6 +214,8 @@ async def truck_live(
         "headingDeg": live.heading_deg,
         "speedKph": live.speed_kph,
         "isMoving": live.is_moving,
+        "positionSuspect": bool(live.position_suspect),
+        "suspectReason": live.suspect_reason,
         "lastSeenAt": live.last_received_at.isoformat() if live.last_received_at else None,
     }
     if own_fleet:
@@ -296,6 +298,10 @@ async def fleet_live(
                 "speedKph": live.speed_kph if has_fix else None,
                 "headingDeg": live.heading_deg if has_fix else None,
                 "lastTemperatureC": live.last_temperature_c if live else None,
+                # The dispatcher is told the position is doubted rather than
+                # being shown a stale one with no explanation.
+                "positionSuspect": bool(live.position_suspect) if live else False,
+                "suspectReason": live.suspect_reason if live else None,
             }
         )
     return fleet

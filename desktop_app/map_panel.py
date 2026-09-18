@@ -36,6 +36,9 @@ MARKER_COLORS = {
     "rescuer": ("#0D9488", "#FFFFFF"),
     "sos": (COLORS["red"], "#FFFFFF"),
     "destination": (COLORS["ink"], "#FFFFFF"),
+    # A position the server flagged as spoofed or impossible. Drawn, but
+    # visibly different from one that is trusted.
+    "suspect": (COLORS["amber"], "#FFFFFF"),
 }
 
 

@@ -15,13 +15,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 import secrets
 import string
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
 from sqlalchemy import delete, select
 
@@ -34,6 +36,7 @@ from services.orchestrator.app.reputation_models import CompanyReputation, Rescu
 from services.sos.app.models import (
     SosAlert,
     SosBroadcast,
+    SosResponse,
     SosCategory,
     SosSeverity,
     SosStatus,
@@ -44,6 +47,7 @@ from services.telemetry.app.models import (
     AlertType,
     CargoReading,
     TelemetryAlert,
+    TelemetryPing,
     TruckLiveState,
 )
 from shared.database import async_session
@@ -64,6 +68,66 @@ DEMO_COMPANY_IDS = (
 )
 
 
+
+def build_track_history(
+    trucks: list[tuple[str, str, str, float, float, float, float]],
+    now: "datetime",
+    minutes: int = 40,
+    interval_seconds: int = 30,
+) -> list["TelemetryPing"]:
+    """Lay a plausible breadcrumb trail behind each truck.
+
+    Positions are walked backwards from where the truck is now, along the
+    reverse of its current heading, at a distance consistent with its speed.
+    A parked truck gets a tight cluster with a little GPS jitter rather than a
+    single point, which is what a stationary phone actually produces.
+    """
+    import math
+    import uuid as _uuid
+
+    pings: list[TelemetryPing] = []
+    steps = max(1, (minutes * 60) // interval_seconds)
+
+    for truck_id, company_id, driver_id, lat, lng, speed_kph, heading in trucks:
+        # Metres covered between two fixes at this speed.
+        step_m = (speed_kph * 1000.0 / 3600.0) * interval_seconds
+        back_bearing = math.radians((heading + 180.0) % 360.0)
+
+        for index in range(steps, 0, -1):
+            distance_m = step_m * index
+            # Rough local projection: fine over the few km a trail covers.
+            d_lat = (distance_m * math.cos(back_bearing)) / 111_320.0
+            d_lng = (distance_m * math.sin(back_bearing)) / (
+                111_320.0 * max(math.cos(math.radians(lat)), 0.01)
+            )
+            # A stationary phone still wanders a few metres between fixes.
+            jitter = 0.00004 if speed_kph < 1 else 0.0
+            recorded = now - timedelta(seconds=interval_seconds * index)
+
+            pings.append(
+                TelemetryPing(
+                    truck_id=truck_id,
+                    driver_id=driver_id,
+                    company_id=company_id,
+                    device_id="seed-" + truck_id,
+                    client_ping_id=_uuid.uuid4().hex[:16],
+                    recorded_at=recorded,
+                    received_at=recorded,
+                    latitude=lat + d_lat + (jitter if index % 2 else -jitter),
+                    longitude=lng + d_lng,
+                    accuracy_m=8.0 if speed_kph > 1 else 14.0,
+                    speed_kph=speed_kph if speed_kph > 1 else 0.0,
+                    heading_deg=heading if speed_kph > 1 else None,
+                    battery_pct=max(35.0, 95.0 - index * 0.4),
+                    is_charging=speed_kph > 1,
+                    network_type="4g",
+                    provider="fused",
+                )
+            )
+
+    return pings
+
+
 async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
     await ensure_schema()
     credentials: list[tuple[str, str, str]] = []
@@ -73,10 +137,12 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
             # Delete dependent entities in clean dependency order
             await session.execute(delete(RescueRating))
             await session.execute(delete(CompanyReputation))
+            await session.execute(delete(SosResponse))
             await session.execute(delete(SosBroadcast))
             await session.execute(delete(SosAlert))
             await session.execute(delete(TelemetryAlert))
             await session.execute(delete(CargoReading))
+            await session.execute(delete(TelemetryPing))
             await session.execute(delete(TruckLiveState))
             await session.execute(delete(LedgerEntry))
             await session.execute(delete(Escrow))
@@ -235,8 +301,10 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
             id="trk_metro_3320",
             company_id=metro.id,
             registration_number="MH-43-MS-3320",
-            latitude=19.0330,
-            longitude=73.0297,
+            # ~7 km north of the Panvel stretch, far enough to be a genuine
+            # candidate rather than a truck parked on top of the emergency.
+            latitude=19.0910,
+            longitude=73.0080,
             status=TruckStatus.idle,
             refrigerated=False,
             max_volume_m3=14.0,
@@ -404,7 +472,11 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
         inc_active = Incident(
             id="inc_apex_refrig_fail",
             shipment_id=shp_insulin.id,
-            state=IncidentState.MATCHING,
+            # Offers have already gone out below, so the incident is past
+            # MATCHING. Seeding it as MATCHING left the data self-
+            # contradictory: confirming one of its own offers was an illegal
+            # transition, and the console got a 500.
+            state=IncidentState.RESCUE_OFFERED,
             lat=18.5204,
             lng=73.8567,
             minutes_until_spoilage=84.0,
@@ -534,17 +606,16 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
         # ------------------------------------------------------------------
         # 7. Escrows & Double-Entry Ledger
         # ------------------------------------------------------------------
-        # Active escrow holding for Northline's accepted offer
-        escrow_active = Escrow(
-            id="esc_apex_refrig_hold",
-            incident_id=inc_active.id,
-            owner_company_id=apex.id,
-            carrier_company_id=northline.id,
-            amount_inr=24500.0,
-            carrier_payout_inr=23275.0,
-            state="ACCEPTED",
-        )
-        # Historic settled escrow
+        # The live incident deliberately has no escrow yet.
+        #
+        # An escrow is opened by the handshake, not before it: the money is
+        # held at the moment the owner confirms a carrier who has already
+        # accepted. Northline has accepted; Apex has not confirmed yet. A
+        # seeded hold here would assert a state the system itself would never
+        # produce, and it would skip the part worth watching -- confirming the
+        # offer is what opens the escrow and posts the balancing hold.
+        #
+        # Historic settled escrow, so the ledger has real history behind it
         escrow_past = Escrow(
             id="esc_apex_hist_rel",
             incident_id=inc_past.id,
@@ -554,28 +625,10 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
             carrier_payout_inr=18810.0,
             state="RELEASED",
         )
-        session.add_all([escrow_active, escrow_past])
+        session.add(escrow_past)
         await session.flush()
 
         # Balancing double-entry ledger postings: debit == credit strictly enforced
-        led1 = LedgerEntry(
-            escrow_id=escrow_active.id,
-            posting_ref="ref_apex_hold_01",
-            posting_type="HOLD",
-            account="ESCROW_HOLDING",
-            debit_inr=24500.0,
-            credit_inr=0.0,
-            memo="Escrow hold pending cargo rescue delivery",
-        )
-        led2 = LedgerEntry(
-            escrow_id=escrow_active.id,
-            posting_ref="ref_apex_hold_01",
-            posting_type="HOLD",
-            account="PAYER_DEPOSIT",
-            debit_inr=0.0,
-            credit_inr=24500.0,
-            memo="Apex deposit for rescue dispatch",
-        )
         led_p1 = LedgerEntry(
             escrow_id=escrow_past.id,
             posting_ref="ref_past_settle_01",
@@ -603,7 +656,7 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
             credit_inr=990.0,
             memo="Platform fee 5%",
         )
-        session.add_all([led1, led2, led_p1, led_p2, led_p3])
+        session.add_all([led_p1, led_p2, led_p3])
         await session.flush()
 
         # ------------------------------------------------------------------
@@ -710,8 +763,8 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
             TruckLiveState(
                 truck_id=trk_metro_3320.id,
                 company_id=metro.id,
-                latitude=19.0330,
-                longitude=73.0297,
+                latitude=19.0910,
+                longitude=73.0080,
                 speed_kph=0.0,
                 heading_deg=270.0,
                 battery_pct=76.0,
@@ -733,6 +786,28 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
             ),
         ]
         session.add_all(live_states)
+        await session.flush()
+
+        # ------------------------------------------------------------------
+        # 8b. Where each truck has actually been
+        # ------------------------------------------------------------------
+        # Without this the console can draw a pin but not a trail, and the
+        # fleet looks teleported rather than driven. Each moving truck gets a
+        # track back along its heading over the last forty minutes, at the
+        # cadence the driver app really uploads at.
+        session.add_all(
+            build_track_history(
+                [
+                    (trk_apex_9042.id, apex.id, drv_apex_rajesh.id, 18.5204, 73.8567, 0.0, 0.0),
+                    (trk_apex_5510.id, apex.id, drv_apex_vikram.id, 18.7500, 73.4200, 62.0, 310.0),
+                    (trk_apex_2201.id, apex.id, drv_apex_amit.id, 19.0330, 73.0297, 54.0, 295.0),
+                    (trk_north_412.id, northline.id, drv_north_sunil.id, 18.5850, 73.7400, 48.0, 140.0),
+                    (trk_north_880.id, northline.id, drv_north_deepak.id, 18.6100, 73.7900, 0.0, 0.0),
+                ],
+                now,
+            )
+        )
+        await session.flush()
         await session.flush()
 
         # Cold-chain telemetry readings for the stranded insulin shipment:
@@ -886,6 +961,103 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
         session.add_all([bcast1, bcast2])
         await session.flush()
 
+        # An emergency raised by the account the console signs in as, so the
+        # SOS screen has its own live alert rather than only somebody else's.
+        # A medical call is the case where the responder board matters most:
+        # the dispatcher is deciding, minute by minute, whether the help
+        # already coming is soon enough.
+        apex_sos = SosAlert(
+            id="sos_apex_medical_01",
+            client_request_id="req_apex_sos_01",
+            company_id=apex.id,
+            driver_id=drv_apex_amit.id,
+            truck_id=trk_apex_2201.id,
+            shipment_id=shp_semicon.id,
+            category=SosCategory.MEDICAL.value,
+            severity=SosSeverity.CRITICAL.value,
+            status=SosStatus.ACKNOWLEDGED.value,
+            latitude=19.0330,
+            longitude=73.0297,
+            accuracy_m=9.0,
+            location_source="gps",
+            landmark_note="NH-48 km 42 southbound, past the Panvel toll",
+            condition_note="Chest pain and sweating, pulled onto the shoulder",
+            persons_affected=1,
+            is_conscious=True,
+            is_breathing=True,
+            is_trapped=False,
+            is_mobile=False,
+            severe_bleeding=False,
+            broadcast_radius_km=25.0,
+            network_broadcast=True,
+            ack_count=2,
+            responder_count=1,
+            reported_at=now - timedelta(minutes=6),
+            broadcast_at=now - timedelta(minutes=6),
+            first_ack_at=now - timedelta(minutes=4),
+            created_by_type="driver",
+            created_by_id=drv_apex_amit.id,
+        )
+        session.add(apex_sos)
+        await session.flush()
+
+        # Two carriers were told, at different distances.
+        session.add_all([
+            SosBroadcast(
+                id="snd_apexsos_north",
+                sos_id=apex_sos.id,
+                recipient_company_id=northline.id,
+                tier="NETWORK",
+                channel="in_app",
+                adapter_name="network_push",
+                redaction_level="REDACTED",
+                distance_km_at_send=6.4,
+                adapter_status="DELIVERED",
+                sent_at=now - timedelta(minutes=6),
+                delivered_at=now - timedelta(minutes=6),
+            ),
+            SosBroadcast(
+                id="snd_apexsos_metro",
+                sos_id=apex_sos.id,
+                recipient_company_id=metro.id,
+                tier="NETWORK",
+                channel="in_app",
+                adapter_name="network_push",
+                redaction_level="REDACTED",
+                distance_km_at_send=11.8,
+                adapter_status="DELIVERED",
+                sent_at=now - timedelta(minutes=6),
+                delivered_at=now - timedelta(minutes=6),
+            ),
+        ])
+
+        # One is already moving with a stated ETA; the other has only
+        # acknowledged. The board shows the difference, because "someone is
+        # coming in 9 minutes" and "someone has seen it" are not the same
+        # thing to a dispatcher deciding whether to escalate.
+        session.add_all([
+            SosResponse(
+                id="rsp_apexsos_north",
+                sos_id=apex_sos.id,
+                responder_company_id=northline.id,
+                responder_truck_id=trk_north_412.id,
+                action="EN_ROUTE",
+                eta_minutes=9.0,
+                distance_km=6.4,
+                note="Driver trained in first aid, diverting now",
+                created_at=now - timedelta(minutes=3),
+            ),
+            SosResponse(
+                id="rsp_apexsos_metro",
+                sos_id=apex_sos.id,
+                responder_company_id=metro.id,
+                action="ACKNOWLEDGE",
+                distance_km=11.8,
+                created_at=now - timedelta(minutes=4),
+            ),
+        ])
+        await session.flush()
+
         # ------------------------------------------------------------------
         # 10. Company Reputation & Ratings
         # ------------------------------------------------------------------
@@ -937,6 +1109,28 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
     return credentials
 
 
+#: Where the seed leaves the accounts it just created.
+#:
+#: The desktop console reads this to offer one-click sign-in for the demo.
+#: It holds live passwords, so it is gitignored and never shipped -- which is
+#: also why the console degrades to an empty login form when it is absent
+#: rather than falling back to a password baked into the source.
+CREDENTIALS_FILE = ROOT / "demo_credentials.json"
+
+
+def write_credentials_file(credentials: list[tuple[str, str, str]]) -> None:
+    payload = {
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "accounts": [
+            {"label": label, "email": email, "password": password}
+            for label, email, password in credentials
+        ],
+    }
+    CREDENTIALS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print()
+    print(f"Credentials written to {CREDENTIALS_FILE.name} (gitignored).")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Seed CargoResQ rich demo data")
     parser.add_argument("--password", help="Use this password for every demo account")
@@ -946,6 +1140,8 @@ def main() -> int:
     credentials = asyncio.run(seed(args.password, args.reset))
     if not credentials:
         return 0
+
+    write_credentials_file(credentials)
 
     print("\n==================================================================")
     print("CargoResQ Enterprise Demo Accounts Initialized")
@@ -960,9 +1156,10 @@ def main() -> int:
     print("  • 5 Shipments (Active cold-chain, precision electronics, cryo plasma, oncology API)")
     print("  • 1 Urgent active breakdown incident with countdown & rescue offers")
     print("  • 1 Historic completed rescue with full audit trail")
-    print("  • 2 Escrows with balanced double-entry ledger postings")
+    print("  • 1 Settled escrow with balanced double-entry ledger postings")
+    print("    (the live rescue opens its own escrow when you confirm the offer)")
     print("  • 23 Cold-chain temperature telemetry logs & critical excursion alerts")
-    print("  • 1 Cross-carrier SOS highway emergency broadcast\n")
+    print("  • 2 SOS emergencies: one raised by your own driver (with responders en route) and one cross-carrier broadcast\n")
     return 0
 
 

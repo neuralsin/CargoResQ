@@ -12,7 +12,7 @@
   during a pilot without that permission ever shipping to Play.
 
   Note: Android's domain-config matches host names and exact addresses, not
-  CIDR ranges -- there is no way to express "any RFC1918 address" here, which
+  CIDR ranges — there is no way to express "any RFC1918 address" here, which
   is precisely why LAN testing belongs in the debug variant.
 -->
 <network-security-config>

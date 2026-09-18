@@ -212,8 +212,18 @@ async def verify_escrow(
     except EscrowNotFound:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Escrow not found")
 
+    # The incident is the operational record; it has to end up saying what
+    # the ledger concluded rather than sitting at VERIFICATION forever.
+    from services.orchestrator.app.dispatch import record_settlement_on_incident
+
+    incident = await record_settlement_on_incident(
+        db, escrow, actor_id_of(principal), event_producer.publish
+    )
+
     payload = _escrow_view(escrow, viewer)
     payload["verification"] = verdict.to_dict()
+    if incident is not None:
+        payload["incidentState"] = incident.state.value
     return payload
 
 

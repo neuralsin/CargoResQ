@@ -251,6 +251,19 @@ class TruckLiveState(Base):
     dwell_anchor_lat: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     dwell_anchor_lng: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
+    #: Set when the last fix looked spoofed or physically impossible.
+    #:
+    #: The position is still recorded. Refusing to update it meant a truck
+    #: that reported a mock location once froze on the dispatcher's map at
+    #: wherever it had last been believed -- and on an emulator, or any device
+    #: with developer options on, every fix is flagged, so the truck never
+    #: moved again. Losing sight of a vehicle is a worse failure than showing
+    #: where it claims to be with a warning attached.
+    position_suspect: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+    suspect_reason: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
     last_temperature_c: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     last_reading_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True

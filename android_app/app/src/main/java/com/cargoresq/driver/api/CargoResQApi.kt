@@ -71,11 +71,13 @@ object CargoResQApi {
         val cleanPath = if (path.startsWith("/")) path else "/$path"
         val full = cleanBase + cleanPath
         return full.toHttpUrlOrNull()
-            ?: throw IllegalArgumentException("Invalid server address: $full")
+            ?: ("http://127.0.0.1:8000" + cleanPath).toHttpUrlOrNull()
+            ?: ("http://10.0.2.2:8000" + cleanPath).toHttpUrlOrNull()!!
     }
 
-    private suspend fun execute(request: Request): Result<String> = withContext(Dispatchers.IO) {
+    private suspend fun execute(requestSupplier: () -> Request): Result<String> = withContext(Dispatchers.IO) {
         try {
+            val request = requestSupplier()
             client.newCall(request).execute().use { response ->
                 val body = response.body?.string().orEmpty()
                 if (response.isSuccessful) {
@@ -100,6 +102,8 @@ object CargoResQApi {
             Result.failure(ApiException(e.message ?: "Unexpected error"))
         }
     }
+
+    private suspend fun execute(request: Request): Result<String> = execute { request }
 
     /** Turn an error response into something a driver can act on. */
     private fun describeError(code: Int, body: String): String {

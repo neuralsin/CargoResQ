@@ -23,7 +23,9 @@ from services.core_api.app.auth import (
     get_current_principal,
 )
 from services.core_api.app.events.producer import event_producer
-from services.core_api.app.models import Driver
+from services.core_api.app.models import Driver, Shipment
+from services.orchestrator.app.models import Incident, IncidentState
+from services.orchestrator.app.orchestrator import advance, create_incident
 from services.matching_engine.app.routing import haversine_distance_km
 from services.telemetry.app.models import TruckLiveState
 from shared.database import get_db
@@ -49,6 +51,7 @@ from .sos_service import (
     raise_sos,
     redacted_view,
     respond,
+    responder_board,
     set_status,
 )
 
@@ -175,7 +178,7 @@ async def create_sos(
             detail={"code": exc.code, "message": str(exc), **exc.context},
         )
 
-    payload = full_view(alert)
+    payload = full_view(alert, responders=await responder_board(db, alert))
     payload["deduplicated"] = not created
     return payload
 
@@ -196,7 +199,8 @@ async def active_alerts(
         )
         .order_by(SosAlert.received_at.desc())
     )
-    return [full_view(a) for a in result.scalars().all()]
+    alerts = list(result.scalars().all())
+    return [full_view(a, responders=await responder_board(db, a)) for a in alerts]
 
 
 @router.get("/nearby")
@@ -263,7 +267,11 @@ async def get_sos(
             .where(SosResponse.sos_id == sos_id)
             .order_by(SosResponse.created_at)
         )
-        return full_view(alert, list(responses.scalars().all()))
+        return full_view(
+            alert,
+            list(responses.scalars().all()),
+            responders=await responder_board(db, alert),
+        )
 
     payload = redacted_view(alert, distance)
     # Once a responder has committed, they get what they need to actually
@@ -358,7 +366,7 @@ async def update_status(
         raise HTTPException(
             status_code=exc.http_status, detail={"code": exc.code, "message": str(exc)}
         )
-    return full_view(alert)
+    return full_view(alert, responders=await responder_board(db, alert))
 
 
 @router.post("/{sos_id}/cancel")
@@ -387,6 +395,101 @@ async def cancel_sos(
     )
     # The response is identical either way, deliberately.
     return {"id": alert.id, "status": "CANCELLED", "cancelledAt": None if not cancelled else True}
+
+
+@router.post("/{sos_id}/escalate-to-incident")
+async def escalate_to_incident(
+    sos_id: str,
+    principal: Dict[str, Any] = Depends(get_current_principal),
+    db: AsyncSession = Depends(get_db),
+):
+    """Turn an SOS into a rescue incident so help can be formally offered.
+
+    An SOS says "something is wrong here". An incident is the thing carriers
+    can be offered, priced and bound against. Until an SOS is escalated there
+    is nothing for the two-way handshake to attach to, so a dispatcher looking
+    at a stranded driver has no way to actually commission a rescue.
+
+    Idempotent: escalating twice returns the incident already created.
+    """
+    alert, role, _ = await _load_for_viewer(sos_id, principal, db)
+    if role != "owner":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the reporting company may escalate their own SOS",
+        )
+
+    if alert.incident_id:
+        incident = await db.get(Incident, alert.incident_id)
+        if incident is not None:
+            return {
+                "sosId": alert.id,
+                "incidentId": incident.id,
+                "state": incident.state.value,
+                "created": False,
+            }
+
+    # The rescue needs a shipment to describe what has to be moved. Prefer the
+    # one the SOS already names, else the load on the driver's truck.
+    shipment_id = alert.shipment_id
+    if not shipment_id and alert.truck_id:
+        found = await db.execute(
+            select(Shipment)
+            .where(Shipment.truck_id == alert.truck_id)
+            .where(Shipment.owner_company_id == alert.company_id)
+            .where(Shipment.status.in_(["in_transit", "breakdown_reported"]))
+            .order_by(Shipment.created_at.desc())
+        )
+        shipment = found.scalars().first()
+        shipment_id = shipment.id if shipment else None
+
+    if not shipment_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "no_shipment",
+                "message": (
+                    "This driver has no active shipment, so there is no cargo to "
+                    "rescue. Assign the load to their truck first."
+                ),
+            },
+        )
+
+    incident = await create_incident(
+        session=db,
+        shipment_id=shipment_id,
+        lat=alert.latitude,
+        lng=alert.longitude,
+        minutes_until_spoilage=None,
+        actor_id=actor_id_of(principal),
+        event_publisher=event_producer.publish,
+    )
+
+    # Move it straight to MATCHING: the emergency has already been triaged by
+    # the driver pressing SOS, and making a dispatcher click through TRIAGING
+    # while someone waits on a hard shoulder helps nobody.
+    for target in (IncidentState.TRIAGING, IncidentState.MATCHING):
+        incident = await advance(
+            session=db,
+            incident_id=incident.id,
+            new_state=target,
+            actor_id=actor_id_of(principal),
+            metadata={"escalatedFromSos": alert.id},
+            event_publisher=event_producer.publish,
+        )
+
+    alert.incident_id = incident.id
+    if alert.status not in {SosStatus.RESOLVED.value, SosStatus.CLOSED.value}:
+        alert.status = SosStatus.ESCALATED.value
+    await db.commit()
+
+    logger.info("sos_escalated_to_incident", sos_id=sos_id, incident_id=incident.id)
+    return {
+        "sosId": alert.id,
+        "incidentId": incident.id,
+        "state": incident.state.value,
+        "created": True,
+    }
 
 
 @router.post("/{sos_id}/share-medical")

@@ -21,6 +21,7 @@ from shared.database import get_db
 from shared.observability import logger
 
 from .authz import load_incident_for_owner
+from .dispatch import escrow_for_incident, sync_escrow_to_incident
 from .models import Incident, IncidentState
 from .orchestrator import (
     IllegalTransition,
@@ -115,7 +116,34 @@ async def list_company_incidents(
         .order_by(Incident.created_at.desc())
         .limit(limit)
     )
-    return [_incident_view(incident, shipment) for incident, shipment in result.all()]
+    rows = result.all()
+    incidents = [_incident_view(incident, shipment) for incident, shipment in rows]
+
+    # Attach each rescue's escrow in one query rather than one per incident.
+    # The console shows where the money sits next to every open rescue, and
+    # an N+1 here would be felt on a busy operations screen.
+    from services.escrow_ledger.app.models import Escrow
+
+    incident_ids = [i["id"] for i in incidents]
+    if incident_ids:
+        escrows = await db.execute(
+            select(Escrow)
+            .where(Escrow.incident_id.in_(incident_ids))
+            .order_by(Escrow.created_at)
+        )
+        by_incident = {e.incident_id: e for e in escrows.scalars().all()}
+        for payload in incidents:
+            escrow = by_incident.get(payload["id"])
+            if escrow is not None:
+                payload["escrow"] = {
+                    "id": escrow.id,
+                    "state": escrow.state,
+                    "amountInr": escrow.amount_inr,
+                    "carrierPayoutInr": escrow.carrier_payout_inr,
+                    "stateReason": escrow.state_reason,
+                }
+
+    return incidents
 
 
 @router.get("/incidents/{id}")
@@ -125,7 +153,17 @@ async def get_incident_by_id(
     db: AsyncSession = Depends(get_db),
 ):
     incident, shipment = await load_incident_for_owner(id, principal, db)
-    return _incident_view(incident, shipment)
+    payload = _incident_view(incident, shipment)
+    escrow = await escrow_for_incident(db, incident.id)
+    if escrow is not None:
+        payload["escrow"] = {
+            "id": escrow.id,
+            "state": escrow.state,
+            "amountInr": escrow.amount_inr,
+            "carrierPayoutInr": escrow.carrier_payout_inr,
+            "stateReason": escrow.state_reason,
+        }
+    return payload
 
 
 @router.post("/incidents/{id}/advance")
@@ -167,13 +205,24 @@ async def advance_incident_state(
     except IncidentNotFound:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
 
+    # The money follows the cargo. Leaving a dispatcher to move the escrow
+    # separately is how the two records end up disagreeing.
+    escrow = await sync_escrow_to_incident(
+        db, incident, event_publisher=event_producer.publish
+    )
+
     logger.info(
         "incident_advanced_via_api",
         incident_id=id,
         new_state=req.new_state.value,
         actor=actor_id_of(principal),
+        escrow_state=escrow.state if escrow else None,
     )
-    return _incident_view(incident, shipment)
+
+    payload = _incident_view(incident, shipment)
+    if escrow is not None:
+        payload["escrow"] = {"id": escrow.id, "state": escrow.state}
+    return payload
 
 
 @router.get("/incidents/{id}/timeline")

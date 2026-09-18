@@ -22,3 +22,6 @@ keystore.properties
 *.keystore
 .venv/
 venv/
+
+# Demo accounts written by scripts/seed_demo.py (live passwords)
+demo_credentials.json
