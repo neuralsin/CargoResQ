@@ -11,3 +11,6 @@ build/
 dist/
 node_modules/
 .expo/
+.gradle/
+**/build/
+*.apk

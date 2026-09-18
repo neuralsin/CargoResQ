@@ -1,0 +1,13 @@
+<resources>
+    <style name="Theme.CargoResQ" parent="Theme.MaterialComponents.Light.NoActionBar">
+        <item name="colorPrimary">@color/uber_black</item>
+        <item name="colorPrimaryVariant">@color/uber_pure_black</item>
+        <item name="colorOnPrimary">@color/uber_white</item>
+        <item name="colorSecondary">@color/uber_teal</item>
+        <item name="colorSecondaryVariant">@color/uber_teal</item>
+        <item name="colorOnSecondary">@color/uber_white</item>
+        <item name="android:statusBarColor">@color/uber_white</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowBackground">@color/uber_canvas</item>
+    </style>
+</resources>

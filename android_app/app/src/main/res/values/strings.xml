@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">CargoResQ Driver</string>
+    <string name="title_home">Home</string>
+    <string name="title_services">Services</string>
+    <string name="title_activity">Activity</string>
+    <string name="title_account">Account</string>
+</resources>

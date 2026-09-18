@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="uber_black">#101615</color>
+    <color name="uber_pure_black">#000000</color>
+    <color name="uber_white">#FFFFFF</color>
+    <color name="uber_canvas">#F6F8F7</color>
+    <color name="uber_surface">#FFFFFF</color>
+    <color name="uber_card_stroke">#E5EAE7</color>
+    <color name="uber_gray_light">#F0F3F2</color>
+    <color name="uber_gray_muted">#7B8683</color>
+    <color name="uber_teal">#0F766E</color>
+    <color name="uber_teal_soft">#E4F3EF</color>
+    <color name="uber_red">#E11900</color>
+    <color name="uber_red_soft">#FDEBE8</color>
+    <color name="uber_amber">#B7791F</color>
+    <color name="uber_amber_soft">#FFF3D6</color>
+    <color name="uber_pill_dark">#101615</color>
+</resources>
