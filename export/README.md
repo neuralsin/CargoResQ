@@ -21,9 +21,8 @@ export/
 ├── brand_hero.png          # High-tech corporate hero visual banner (PNG)
 ├── brand_hero.jpg          # Alternative high-res hero format
 ├── logo.svg                # Scalable vector graphics logo
-│
-├── CargoResQ-Driver.apk    # Native Android driver app (Android 8.0 - 14+)
-│
+├── CargoResQ.apk           # Primary Android driver app (named after project)
+├── CargoResQ-Driver.apk    # Alternative alias for APK installer scripts
 ├── run_all.bat             # One-click master launcher (seeds DB, boots server, opens desktop console)
 ├── 1_start_backend.bat     # Launches the FastAPI Core API & Orchestrator on port 8000
 ├── 1_start_backend.ps1     # PowerShell version of backend launcher
