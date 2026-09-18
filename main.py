@@ -96,6 +96,31 @@ app.include_router(orchestrator_router)
 app.include_router(simulation_router)
 
 
+from pathlib import Path
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/", include_in_schema=False)
+async def serve_desktop_console():
+    index_file = STATIC_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file)
+    return {"message": "CargoResQ API Server running. Visit /docs for OpenAPI."}
+
+
+@app.get("/mobile", include_in_schema=False)
+async def serve_mobile_driver_app():
+    mobile_file = STATIC_DIR / "mobile.html"
+    if mobile_file.exists():
+        return FileResponse(mobile_file)
+    return {"message": "CargoResQ Mobile Driver App not found."}
+
+
 # Phase 6: Real-Time WebSocket Gateway endpoint
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -134,3 +159,4 @@ async def metrics():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+
