@@ -1,38 +1,72 @@
-# CargoResQ deployment runbook
+# CargoResQ — Production Deployment Runbook
+
+> **Repository**: [https://github.com/neuralsin/CargoResQ](https://github.com/neuralsin/CargoResQ)
 
 CargoResQ has two supported client modes:
 
-- `desktop_app/` is a native CustomTkinter operations console. It is packaged as a Windows executable and connects to the API origin configured by `CARGOESQ_API_URL`.
-- `mobile/` is the dedicated Android driver app. It uses EAS to produce an Android App Bundle and sends driver GPS only when the driver reports a breakdown.
+- `desktop_app/`: Native CustomTkinter operations console packaged as a Windows executable connecting to `CARGOESQ_API_URL`.
+- `android_app/`: Dedicated native Kotlin Android driver app compiled with Gradle to produce an APK / AAB. Features persistent background telemetry and emergency SOS transponder.
 
-## API release
+---
 
-1. Provision PostgreSQL 16 with PostGIS, Redis, Kafka (or the configured event provider), object storage, TLS, and a secret manager.
-2. Set `DATABASE_URL`, `JWT_SECRET` (32+ random characters), `ALLOWED_ORIGINS`, `REDIS_URL`, `KAFKA_BOOTSTRAP_SERVERS`, and `OSRM_BASE_URL` in the deployment environment.
-3. Build and tag the root-context image:
+## 1. Backend API Release
 
+1. **Infrastructure Requirements**:
+   - PostgreSQL 16 with PostGIS extension enabled.
+   - Redis (for distributed WebSocket room clustering).
+   - Kafka cluster (optional, for cross-service event streaming).
+   - Reverse proxy / Ingress with TLS termination (Nginx, Traefik, or AWS ALB).
+
+2. **Required Environment Variables**:
+   - `DATABASE_URL`: `postgresql+asyncpg://user:pass@host:5432/cargoresq`
+   - `JWT_SECRET`: 32+ cryptographically random characters
+   - `ALLOWED_ORIGINS`: Comma-separated list of permitted origins
+   - `REDIS_URL`: `redis://redis-host:6379/0`
+   - `ENVIRONMENT`: `production`
+
+3. **Docker Container Build**:
    ```bash
-   docker build -f services/core_api/Dockerfile -t cargoresq/core-api:<release> .
-   docker push cargoresq/core-api:<release>
+   docker build -f services/core_api/Dockerfile -t cargoresq/core-api:<release-tag> .
+   docker push cargoresq/core-api:<release-tag>
    ```
 
-4. Run the versioned migrations before starting new pods:
-
+4. **Run Versioned Migrations**:
+   Run database schema migrations before promoting traffic to new containers:
    ```bash
-   cd services/core_api && alembic upgrade head
+   alembic upgrade head
    ```
 
-5. Deploy `infra/k8s/core-api-deployment.yaml` after replacing the image tag and applying a real Secret. Do not commit credentials or use the development fallback secret in production.
-6. Verify `/health`, `/docs`, `/metrics`, company login, driver login, and a test SOS in staging before promoting the image.
+5. **Kubernetes Deployment**:
+   Apply updated manifests from `infra/k8s/` after injecting production secrets via Kubernetes Secret / Vault.
+   Never commit plain-text credentials or production secrets to source control.
 
-## Operational safeguards
+---
 
-- Keep the API behind HTTPS and restrict `ALLOWED_ORIGINS` to the published operations and driver origins.
-- Run a staging database and synthetic rescue scenario on every release.
-- Back up PostgreSQL/WAL and rehearse restore; keep Kafka event retention long enough to rebuild realtime projections.
-- Treat `/metrics` as internal telemetry and protect it at the ingress/network layer.
-- Configure Sentry/OpenTelemetry and a managed OSRM instance before real traffic; the public OSRM endpoint is only a fallback for development.
+## 2. Operational Safeguards & Monitoring
 
-## Store release checklist
+- **Health Checks**: Verify `/health`, `/docs`, `/metrics`, and Prometheus endpoints before routing public ingress.
+- **WebSocket Gateway**: Protect `/ws` behind SSL (`wss://`) with sticky session routing or Redis-backed room pub/sub.
+- **Continuous Integration**: Ensure all 105 automated unit and integration tests pass via GitHub Actions before merging PRs to `main`.
+- **Database Backups**: Enable continuous WAL archiving and automated point-in-time recovery for PostgreSQL.
+- **Log Aggregation**: Structured JSON logs are emitted via `structlog` to stdout, ready for ingestion into Datadog, Grafana Loki, or ELK Stack.
 
-Before publishing the driver app, configure the EAS project ID, signing credentials, Play Console service account, privacy policy URL, support email, screenshots, and a production `EXPO_PUBLIC_API_BASE_URL`. The repository includes `mobile/PRIVACY.md` as a starting point, not a substitute for the operator's legal notice.
+---
+
+## 3. Client Release Checklist
+
+### Android Driver App (`android_app/`)
+- Set production API URL in `CargoResQApi.kt` (`https://api.cargoresq.in`).
+- Sign the release APK / Android App Bundle (AAB) using a production keystore:
+  ```bash
+  cd android_app
+  ./gradlew bundleRelease
+  ```
+- Configure Google Play Console listing, screenshots, privacy policy URL, and support contacts.
+
+### Desktop Operations Console (`desktop_app/`)
+- Compile production Windows binary using PyInstaller:
+  ```powershell
+  ./desktop_app/build_windows.ps1
+  ```
+- Sign `CargoResQ.exe` with an EV Code Signing certificate.
+- Package with Inno Setup or WiX for Windows installer distribution.

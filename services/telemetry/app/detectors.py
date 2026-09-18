@@ -36,6 +36,7 @@ IMPLAUSIBLE_SPEED_KPH = 120.0
 #: 500 m of GPS error trivially implies 600 km/h, and the alert fires on
 #: ordinary noise from a cheap receiver rather than on spoofing.
 MIN_JUMP_INTERVAL_SECONDS = 20.0
+MAX_JUMP_INTERVAL_SECONDS = 600.0  # Beyond 10 mins, a truck can legitimately be at a new location
 MAX_JUMP_ACCURACY_M = 200.0
 
 #: Below this speed the truck is considered stationary.
@@ -141,7 +142,7 @@ def detect_impossible_jump(
         return None
 
     seconds = (now - before).total_seconds()
-    if seconds < MIN_JUMP_INTERVAL_SECONDS:
+    if seconds < MIN_JUMP_INTERVAL_SECONDS or seconds > MAX_JUMP_INTERVAL_SECONDS:
         return None
 
     accuracy = ping.get("accuracy_m")

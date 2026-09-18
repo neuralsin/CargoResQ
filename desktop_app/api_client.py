@@ -240,13 +240,26 @@ class CargoResQClient:
     def acknowledge_sos(self, sos_id: str) -> Dict[str, Any]:
         return self.post(f"/api/v1/sos/{sos_id}/acknowledge")
 
+    #: The only actions the server accepts. Sending anything else is a 422,
+    #: and it used to be sent from a button labelled "Dispatch rescue".
+    SOS_ACTIONS = ("EN_ROUTE", "ON_SCENE", "STOOD_DOWN", "UNABLE", "INFO")
+
     def respond_to_sos(
         self, sos_id: str, action: str, eta_minutes: Optional[float] = None
     ) -> Dict[str, Any]:
+        if action not in self.SOS_ACTIONS:
+            raise ApiError(
+                f"{action!r} is not a valid SOS response. "
+                f"Expected one of {list(self.SOS_ACTIONS)}."
+            )
         return self.post(
             f"/api/v1/sos/{sos_id}/respond",
             json={"action": action, "eta_minutes": eta_minutes},
         )
+
+    def escalate_sos_to_incident(self, sos_id: str) -> Dict[str, Any]:
+        """Turn an SOS into a rescue incident that carriers can be offered."""
+        return self.post(f"/api/v1/sos/{sos_id}/escalate-to-incident")
 
     def resolve_sos(self, sos_id: str, code: str, note: str = "") -> Dict[str, Any]:
         return self.post(

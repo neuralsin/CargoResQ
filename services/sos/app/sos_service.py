@@ -16,7 +16,7 @@ device the numbers to dial. The call is placed by the phone.
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.core_api.app.models import Company, Driver, Shipment, Truck
@@ -154,6 +154,22 @@ async def raise_sos(
         client_request_id=client_request_id,
     )
     session.add(alert)
+
+    # An SOS is an authoritative driver fix: immediately sync the truck's believed location
+    if driver and driver.assigned_truck_id:
+        truck = await session.get(Truck, driver.assigned_truck_id)
+        if truck:
+            truck.latitude = latitude
+            truck.longitude = longitude
+            live = await session.get(TruckLiveState, truck.id)
+            if live is None:
+                live = TruckLiveState(truck_id=truck.id, company_id=truck.company_id)
+                session.add(live)
+            live.latitude = latitude
+            live.longitude = longitude
+            live.last_recorded_at = _now()
+            live.last_received_at = _now()
+
     await session.flush()
 
     await _log_event(
@@ -166,6 +182,13 @@ async def raise_sos(
         SosStatus.NEW.value,
         {"category": category.value, "severity": severity.value},
     )
+
+    # An emergency puts the driver on their company's map immediately, even
+    # if they never went on duty. Waiting for the telemetry service to start
+    # and produce a fix is exactly the wrong behaviour here: the position is
+    # in our hands already, and the dispatcher needs to see it now.
+    if driver is not None and driver.assigned_truck_id:
+        await _pin_truck_to_sos(session, driver.assigned_truck_id, alert)
 
     recipients = await _compute_audience(session, alert)
     for company_id_, tier, distance in recipients:
@@ -201,6 +224,37 @@ async def raise_sos(
     return alert, True
 
 
+async def _pin_truck_to_sos(
+    session: AsyncSession, truck_id: str, alert: SosAlert
+) -> None:
+    """Record the SOS position as the truck's current position.
+
+    The alert already carries a GPS fix taken on the device, so there is no
+    reason to make the dispatcher wait for the next telemetry batch to find
+    out where their driver is.
+    """
+    truck = await session.get(Truck, truck_id)
+    if truck is None:
+        return
+
+    live = await session.get(TruckLiveState, truck_id)
+    if live is None:
+        live = TruckLiveState(truck_id=truck_id, company_id=truck.company_id)
+        session.add(live)
+
+    live.latitude = alert.latitude
+    live.longitude = alert.longitude
+    live.last_recorded_at = alert.reported_at
+    live.last_received_at = _now()
+    live.is_moving = False
+    live.position_suspect = False
+    live.suspect_reason = None
+
+    truck.latitude = alert.latitude
+    truck.longitude = alert.longitude
+    await session.flush()
+
+
 async def _compute_audience(
     session: AsyncSession, alert: SosAlert
 ) -> List[Tuple[str, str, Optional[float]]]:
@@ -218,24 +272,159 @@ async def _compute_audience(
     if not alert.network_broadcast or alert.severity == SosSeverity.MODERATE.value:
         return audience
 
-    result = await session.execute(
-        select(Truck.company_id, TruckLiveState.latitude, TruckLiveState.longitude)
-        .join(TruckLiveState, TruckLiveState.truck_id == Truck.id)
-        .where(Truck.company_id != alert.company_id)
-        .where(TruckLiveState.latitude.is_not(None))
-    )
-
-    nearest: Dict[str, float] = {}
-    for company_id, lat, lng in result.all():
-        km = haversine_distance_km(alert.latitude, alert.longitude, lat, lng)
-        if km <= alert.broadcast_radius_km:
-            if company_id not in nearest or km < nearest[company_id]:
-                nearest[company_id] = km
-
-    for company_id, km in sorted(nearest.items(), key=lambda kv: kv[1]):
-        audience.append((company_id, "NETWORK", round(km, 2)))
+    for candidate in await nearest_trucks_by_company(session, alert):
+        audience.append((candidate["companyId"], "NETWORK", candidate["distanceKm"]))
 
     return audience
+
+
+#: Assumed average road speed for an ETA, in km/h. Deliberately conservative:
+#: an over-optimistic ETA on an emergency is worse than a cautious one,
+#: because it is the number the dispatcher decides to wait on.
+ASSUMED_RESPONSE_SPEED_KPH = 42.0
+
+
+def estimate_eta_minutes(distance_km: float) -> float:
+    """Minutes for a truck to cover this distance, plus time to get moving.
+
+    Straight-line distance understates road distance, so it is inflated by a
+    tortuosity factor before being converted to time.
+    """
+    road_km = distance_km * 1.3
+    driving = (road_km / ASSUMED_RESPONSE_SPEED_KPH) * 60.0
+    # A driver has to notice, decide and pull out. Pretending help departs
+    # instantly is how an ETA becomes a broken promise.
+    return round(driving + 4.0, 1)
+
+
+async def nearest_trucks_by_company(
+    session: AsyncSession, alert: SosAlert
+) -> List[Dict[str, Any]]:
+    """The closest usable truck from each other carrier within the radius.
+
+    One truck per company: a carrier with six trucks nearby is one responder
+    who can send their best, not six separate offers of help.
+    """
+    result = await session.execute(
+        select(
+            Truck.id,
+            Truck.company_id,
+            Truck.registration_number,
+            Truck.refrigerated,
+            Truck.status,
+            Company.name,
+            func.coalesce(TruckLiveState.latitude, Truck.latitude).label("lat"),
+            func.coalesce(TruckLiveState.longitude, Truck.longitude).label("lng"),
+            TruckLiveState.last_received_at,
+        )
+        .join(Company, Company.id == Truck.company_id)
+        .outerjoin(TruckLiveState, TruckLiveState.truck_id == Truck.id)
+        .where(Truck.company_id != alert.company_id)
+        .where(func.coalesce(TruckLiveState.latitude, Truck.latitude).is_not(None))
+    )
+
+    best: Dict[str, Dict[str, Any]] = {}
+    for (
+        truck_id,
+        company_id,
+        registration,
+        refrigerated,
+        status,
+        company_name,
+        lat,
+        lng,
+        last_seen,
+    ) in result.all():
+        if lat is None or lng is None:
+            continue
+        km = haversine_distance_km(alert.latitude, alert.longitude, float(lat), float(lng))
+        if km > alert.broadcast_radius_km:
+            continue
+        existing = best.get(company_id)
+        if existing is not None and existing["distanceKm"] <= km:
+            continue
+        best[company_id] = {
+            "companyId": company_id,
+            "companyName": company_name,
+            "truckId": truck_id,
+            "registrationNumber": registration,
+            "refrigerated": bool(refrigerated),
+            "truckStatus": getattr(status, "value", status),
+            "distanceKm": round(km, 2),
+            "etaMinutes": estimate_eta_minutes(km),
+            "positionIsLive": last_seen is not None,
+        }
+
+    return sorted(best.values(), key=lambda c: c["distanceKm"])
+
+
+async def responder_board(
+    session: AsyncSession, alert: SosAlert
+) -> List[Dict[str, Any]]:
+    """Who was told, how far away they are, and what they have said.
+
+    This is what the dispatcher actually needs while waiting: not "an alert
+    was broadcast", but which carriers are near enough to help, how long each
+    would take, and whether any of them has committed yet.
+    """
+    told = await session.execute(
+        select(SosBroadcast)
+        .where(SosBroadcast.sos_id == alert.id)
+        .where(SosBroadcast.tier == "NETWORK")
+    )
+    broadcasts = {b.recipient_company_id: b for b in told.scalars().all()}
+    if not broadcasts:
+        return []
+
+    names = await session.execute(
+        select(Company.id, Company.name).where(Company.id.in_(list(broadcasts)))
+    )
+    company_names = dict(names.all())
+
+    replies = await session.execute(
+        select(SosResponse)
+        .where(SosResponse.sos_id == alert.id)
+        .order_by(SosResponse.created_at)
+    )
+    latest: Dict[str, SosResponse] = {}
+    for reply in replies.scalars().all():
+        latest[reply.responder_company_id] = reply
+
+    board: List[Dict[str, Any]] = []
+    for company_id, broadcast in broadcasts.items():
+        reply = latest.get(company_id)
+        distance = broadcast.distance_km_at_send
+        board.append(
+            {
+                "companyId": company_id,
+                "companyName": company_names.get(company_id, "Unknown carrier"),
+                "distanceKm": distance,
+                # The carrier's own stated ETA wins over our estimate: they
+                # know their traffic and their driver, we are guessing.
+                "etaMinutes": (
+                    reply.eta_minutes
+                    if reply is not None and reply.eta_minutes is not None
+                    else (estimate_eta_minutes(distance) if distance is not None else None)
+                ),
+                "etaIsEstimate": reply is None or reply.eta_minutes is None,
+                "notifiedAt": broadcast.sent_at.isoformat() if broadcast.sent_at else None,
+                "status": reply.action if reply is not None else "NOTIFIED",
+                "note": reply.note if reply is not None else None,
+                "respondedAt": (
+                    reply.created_at.isoformat()
+                    if reply is not None and reply.created_at
+                    else None
+                ),
+            }
+        )
+
+    # Committed responders first, then by how soon they could arrive.
+    priority = {"ON_SCENE": 0, "EN_ROUTE": 1, "ACKNOWLEDGE": 2, "NOTIFIED": 3,
+                "INFO": 4, "UNABLE": 5, "STOOD_DOWN": 6}
+    return sorted(
+        board,
+        key=lambda r: (priority.get(r["status"], 9), r["etaMinutes"] or 1e9),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +432,11 @@ async def _compute_audience(
 # ---------------------------------------------------------------------------
 
 
-def full_view(alert: SosAlert, responses: Optional[List[SosResponse]] = None) -> Dict[str, Any]:
+def full_view(
+    alert: SosAlert,
+    responses: Optional[List[SosResponse]] = None,
+    responders: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     """Everything, for the reporting company and platform operations."""
     return {
         "id": alert.id,
@@ -276,6 +469,12 @@ def full_view(alert: SosAlert, responses: Optional[List[SosResponse]] = None) ->
         "resolvedAt": alert.resolved_at.isoformat() if alert.resolved_at else None,
         "resolutionCode": alert.resolution_code,
         "responses": [_response_view(r) for r in (responses or [])],
+        # Which nearby carriers were told, how far out they are and what they
+        # have said. This is the part the dispatcher watches while waiting.
+        "responders": responders or [],
+        "respondersEnRoute": len(
+            [r for r in (responders or []) if r.get("status") in {"EN_ROUTE", "ON_SCENE"}]
+        ),
         # Restated on every payload so no client can present this as a
         # dispatch to the emergency services.
         "psapDispatched": False,
@@ -662,6 +861,12 @@ async def _publish(
             "category": alert.category,
             "severity": alert.severity,
             "status": alert.status,
+            "latitude": alert.latitude,
+            "longitude": alert.longitude,
+            "accuracyM": alert.accuracy_m,
+            "landmarkNote": alert.landmark_note,
+            "driverId": alert.driver_id,
+            "truckId": alert.truck_id,
             "approxLat": round(alert.latitude, REDACTED_COORD_PLACES),
             "approxLng": round(alert.longitude, REDACTED_COORD_PLACES),
             "networkRecipients": [c for c, tier, _ in recipients if tier == "NETWORK"],

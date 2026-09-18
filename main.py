@@ -268,6 +268,30 @@ async def metrics():
     return metrics_endpoint_response()
 
 
+def print_network_help(port: int) -> None:
+    import socket
+    lan_ip = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        lan_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        pass
+
+    print("\n" + "=" * 60)
+    print(f"  CargoResQ Backend is LIVE on port {port}")
+    print("=" * 60)
+    print("  Driver Mobile App Connection Addresses:")
+    if lan_ip:
+        print(f"  * Wi-Fi / Hotspot:   http://{lan_ip}:{port}")
+    print(f"  * USB Cable:         http://127.0.0.1:{port} (run connect_phone_usb.bat)")
+    print(f"  * Android Emulator:  http://10.0.2.2:{port}")
+    print("  [NOTE] Do NOT use WSL virtual adapter (e.g. 172.19.x.x)!")
+    print("=" * 60 + "\n")
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
+    print_network_help(port)
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)

@@ -32,25 +32,42 @@ object Session {
     private const val KEY_BASE_URL = "base_url"
     private const val KEY_DEVICE_ID = "device_id"
 
-    private lateinit var prefs: SharedPreferences
+    private var prefs: SharedPreferences? = null
+
+    /** True once init() has run in this process. */
+    private val isReady: Boolean get() = prefs != null
 
     @Volatile
     var current: DriverSession? = null
         private set
 
+    /**
+     * Load the stored session. Safe to call more than once.
+     *
+     * The telemetry service calls this too, because Android can restart the
+     * service into a fresh process without ever creating MainActivity. When
+     * that happened the session object was still empty and `prefs` was an
+     * uninitialised lateinit, so the first upload threw
+     * UninitializedPropertyAccessException from a coroutine with no handler
+     * and took the process down -- which Android then restarted, producing a
+     * crash every few seconds.
+     */
+    @Synchronized
     fun init(context: Context) {
-        prefs = openPreferences(context)
-        CargoResQApi.baseUrl = prefs.getString(KEY_BASE_URL, CargoResQApi.baseUrl)
+        if (isReady) return
+        prefs = openPreferences(context.applicationContext)
+        val store = prefs ?: return
+        CargoResQApi.baseUrl = store.getString(KEY_BASE_URL, CargoResQApi.baseUrl)
             ?: CargoResQApi.baseUrl
 
-        val token = prefs.getString(KEY_TOKEN, null)
+        val token = store.getString(KEY_TOKEN, null)
         if (!token.isNullOrBlank()) {
             current = DriverSession(
                 token = token,
-                driverId = prefs.getString(KEY_DRIVER_ID, "").orEmpty(),
-                driverName = prefs.getString(KEY_DRIVER_NAME, "").orEmpty(),
-                companyId = prefs.getString(KEY_COMPANY_ID, "").orEmpty(),
-                email = prefs.getString(KEY_EMAIL, "").orEmpty(),
+                driverId = store.getString(KEY_DRIVER_ID, "").orEmpty(),
+                driverName = store.getString(KEY_DRIVER_NAME, "").orEmpty(),
+                companyId = store.getString(KEY_COMPANY_ID, "").orEmpty(),
+                email = store.getString(KEY_EMAIL, "").orEmpty(),
             )
         }
     }
@@ -72,31 +89,31 @@ object Session {
 
     fun save(session: DriverSession) {
         current = session
-        prefs.edit()
-            .putString(KEY_TOKEN, session.token)
-            .putString(KEY_DRIVER_ID, session.driverId)
-            .putString(KEY_DRIVER_NAME, session.driverName)
-            .putString(KEY_COMPANY_ID, session.companyId)
-            .putString(KEY_EMAIL, session.email)
-            .apply()
+        prefs?.edit()?.apply {
+            putString(KEY_TOKEN, session.token)
+            putString(KEY_DRIVER_ID, session.driverId)
+            putString(KEY_DRIVER_NAME, session.driverName)
+            putString(KEY_COMPANY_ID, session.companyId)
+            putString(KEY_EMAIL, session.email)
+        }?.apply()
     }
 
     fun clear() {
         current = null
-        prefs.edit()
-            .remove(KEY_TOKEN)
-            .remove(KEY_DRIVER_ID)
-            .remove(KEY_DRIVER_NAME)
-            .remove(KEY_COMPANY_ID)
-            .remove(KEY_EMAIL)
-            .apply()
+        prefs?.edit()?.apply {
+            remove(KEY_TOKEN)
+            remove(KEY_DRIVER_ID)
+            remove(KEY_DRIVER_NAME)
+            remove(KEY_COMPANY_ID)
+            remove(KEY_EMAIL)
+        }?.apply()
     }
 
     var baseUrl: String
         get() = CargoResQApi.baseUrl
         set(value) {
             CargoResQApi.baseUrl = value
-            prefs.edit().putString(KEY_BASE_URL, CargoResQApi.baseUrl).apply()
+            prefs?.edit()?.putString(KEY_BASE_URL, CargoResQApi.baseUrl)?.apply()
         }
 
     /**
@@ -109,9 +126,13 @@ object Session {
      */
     val deviceId: String
         get() {
-            prefs.getString(KEY_DEVICE_ID, null)?.let { return it }
+            val store = prefs
+                // Never throw from here: this is read on the upload path,
+                // inside a coroutine, where an exception ends the process.
+                ?: return "dev-unprovisioned"
+            store.getString(KEY_DEVICE_ID, null)?.let { return it }
             val generated = "dev-" + UUID.randomUUID().toString().take(12)
-            prefs.edit().putString(KEY_DEVICE_ID, generated).apply()
+            store.edit().putString(KEY_DEVICE_ID, generated).apply()
             return generated
         }
 

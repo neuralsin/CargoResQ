@@ -331,6 +331,25 @@ async def _try_bind(
     if truck is not None:
         truck.status = TruckStatus.dispatched_rescue
 
+    # An incident with live offers on it should be at RESCUE_OFFERED, but a
+    # rescue must not fail to bind because its state lagged -- the offers are
+    # real, both parties have agreed, and refusing now would strand the cargo
+    # over a bookkeeping detail. Step it up first if needed.
+    incident_now = await session.get(Incident, offer.incident_id)
+    if incident_now is not None and incident_now.state in {
+        IncidentState.TRIAGING,
+        IncidentState.MATCHING,
+    }:
+        await advance(
+            session,
+            offer.incident_id,
+            IncidentState.RESCUE_OFFERED,
+            actor_id="system",
+            metadata={"reason": "offers already outstanding", "offerId": offer.id},
+            event_publisher=None,
+            commit=False,
+        )
+
     await advance(
         session,
         offer.incident_id,
@@ -450,8 +469,17 @@ async def cancel_bound_offer(
     if truck is not None:
         truck.status = TruckStatus.idle
 
+    # A rescue can fall through at any point before the cargo is aboard, not
+    # only in the moment after it was agreed. Handling just RESCUE_ACCEPTED
+    # left an incident wedged the instant the driver had set off, with the
+    # cargo still stranded and no way to look for anyone else.
+    unwindable = {
+        IncidentState.RESCUE_ACCEPTED,
+        IncidentState.DRIVER_EN_ROUTE,
+    }
+
     incident = await session.get(Incident, offer.incident_id)
-    if incident is not None and incident.state == IncidentState.RESCUE_ACCEPTED:
+    if incident is not None and incident.state in unwindable:
         await advance(
             session,
             incident.id,

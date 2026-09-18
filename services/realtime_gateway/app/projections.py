@@ -341,6 +341,45 @@ async def project_telemetry_alert(
     ]
 
 
+async def project_telemetry_location(
+    envelope: Dict[str, Any], db: Optional[AsyncSession] = None
+) -> List[Delivery]:
+    """Move a truck on its own company's map.
+
+    Own company only. A position is the most sensitive routine thing the
+    platform holds -- it says where a competitor's vehicle and driver are at
+    this moment -- so it never leaves the operating company except through the
+    narrow, time-bounded read a bound rescue opens up.
+    """
+    p = _payload_of(envelope)
+    company_id = p.get("companyId")
+    if not company_id:
+        return []
+    return [
+        Delivery(
+            company_room(company_id),
+            _envelope(
+                "telemetry.location",
+                {
+                    "truckId": p.get("truckId"),
+                    "registrationNumber": p.get("registrationNumber"),
+                    "driverId": p.get("driverId"),
+                    "latitude": p.get("latitude"),
+                    "longitude": p.get("longitude"),
+                    "speedKph": p.get("speedKph"),
+                    "headingDeg": p.get("headingDeg"),
+                    "batteryPct": p.get("batteryPct"),
+                    # Carried so the map can draw an unverified fix
+                    # differently rather than presenting it as trusted.
+                    "positionSuspect": bool(p.get("positionSuspect", False)),
+                    "suspectReason": p.get("suspectReason"),
+                    "recordedAt": p.get("recordedAt"),
+                },
+            ),
+        )
+    ]
+
+
 async def project_sos(
     envelope: Dict[str, Any], db: Optional[AsyncSession]
 ) -> List[Delivery]:
@@ -364,6 +403,11 @@ async def project_sos(
         "severity": p.get("severity"),
         "status": p.get("status"),
         "ackCount": p.get("ackCount"),
+        "latitude": p.get("latitude"),
+        "longitude": p.get("longitude"),
+        "landmarkNote": p.get("landmarkNote"),
+        "driverId": p.get("driverId"),
+        "truckId": p.get("truckId"),
         "isOwnDriver": True,
     }
     deliveries = [Delivery(company_room(company_id), _envelope(event_type, own))]
@@ -431,6 +475,7 @@ for _name in _OFFER_EVENTS:
     PROJECTIONS[_name] = project_offer_event
 
 PROJECTIONS["telemetry.alert"] = project_telemetry_alert
+PROJECTIONS["telemetry.location"] = project_telemetry_location
 
 _SOS_EVENTS = [
     "sos.raised",

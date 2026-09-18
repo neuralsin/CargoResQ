@@ -1,6 +1,7 @@
 package com.cargoresq.driver.telemetry
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -10,6 +11,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -19,13 +21,16 @@ import android.os.IBinder
 import android.os.Looper
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import com.cargoresq.driver.MainActivity
 import com.cargoresq.driver.R
 import com.cargoresq.driver.Session
 import com.cargoresq.driver.api.CargoResQApi
 import com.cargoresq.driver.model.QueuedPing
 import com.google.android.gms.location.*
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -66,10 +71,10 @@ class TelemetryService : Service() {
         private const val NOTIFICATION_ID = 4201
 
         /** Cadence while moving, and while parked. */
-        private const val MOVING_INTERVAL_MS = 30_000L
-        private const val STATIONARY_INTERVAL_MS = 300_000L
+        private const val MOVING_INTERVAL_MS = 5_000L
+        private const val STATIONARY_INTERVAL_MS = 15_000L
 
-        private const val UPLOAD_INTERVAL_MS = 60_000L
+        private const val UPLOAD_INTERVAL_MS = 5_000L
         private const val BATCH_SIZE = 50
         private const val QUEUE_LIMIT = 2_000
 
@@ -101,10 +106,26 @@ class TelemetryService : Service() {
 
         @Volatile
         var lastError: String? = null
+
+        @Volatile
+        var lastLocation: Location? = null
     }
 
-    private val scope = CoroutineScope(SupervisorJob())
+    /**
+     * An exception in a launched coroutine reaches the thread's default
+     * handler and kills the process. SupervisorJob stops one child failing
+     * its siblings; it does nothing about an unhandled throw. The handler is
+     * what keeps a bad upload from taking the app down mid-shift.
+     */
+    private val crashGuard = CoroutineExceptionHandler { _, throwable ->
+        lastError = throwable.message ?: throwable::class.java.simpleName
+    }
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + crashGuard)
     private var uploadJob: Job? = null
+
+    /** Whether startForeground() actually succeeded. */
+    private var isForeground = false
 
     /** Bounded FIFO. Oldest fixes are dropped first when it overflows. */
     private val queue = ArrayDeque<QueuedPing>()
@@ -118,24 +139,93 @@ class TelemetryService : Service() {
         timeZone = TimeZone.getTimeZone("UTC")
     }
 
+    override fun onCreate() {
+        super.onCreate()
+        // Android can restart this service into a fresh process without ever
+        // creating MainActivity, so the session has to be loaded here too.
+        Session.init(applicationContext)
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_STOP -> {
-                stopTracking()
-                stopSelf()
-                return START_NOT_STICKY
-            }
-            else -> {
-                startForeground(NOTIFICATION_ID, buildNotification("Sharing position with dispatch"))
-                startTracking()
-            }
+        if (intent?.action == ACTION_STOP) {
+            shutDown()
+            return START_NOT_STICKY
         }
-        // START_STICKY: if Android kills us under memory pressure, come back.
-        // A truck that silently stopped reporting looks identical to a truck
-        // that has stopped moving, and the difference matters.
+
+        // A null intent means Android restarted us after killing the process.
+        // Only carry on if there is still something to report with.
+        if (intent == null && (Session.token == null || !hasLocationPermission())) {
+            shutDown()
+            return START_NOT_STICKY
+        }
+
+        // Becoming foreground is not optional and not something we can retry
+        // later. Once startForegroundService() has been called, Android gives
+        // the service about five seconds to call startForeground(); if it does
+        // not, the system throws RemoteServiceException and kills the whole
+        // process -- from outside our code, so no try/catch can stop it. With
+        // START_STICKY the service is then restarted straight back into the
+        // same failure, which is what made the app appear to close itself
+        // every few seconds.
+        //
+        // So: if we cannot go foreground, we stop cleanly instead.
+        if (!enterForeground()) {
+            shutDown()
+            return START_NOT_STICKY
+        }
+
+        if (!hasLocationPermission()) {
+            lastError = "Location permission not granted"
+            shutDown()
+            return START_NOT_STICKY
+        }
+
+        startTracking()
         return START_STICKY
+    }
+
+    /** Try to become a foreground service. Returns false if the system refused. */
+    private fun enterForeground(): Boolean {
+        val notification = try {
+            buildNotification("Sharing position with dispatch")
+        } catch (e: Exception) {
+            lastError = "Could not build the duty notification: " + (e.message ?: "")
+            return false
+        }
+
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ServiceCompat.startForeground(
+                    this,
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION,
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+            isForeground = true
+            true
+        } catch (e: Exception) {
+            // Android 12+ refuses a background start; 14+ additionally
+            // refuses a location-typed service without the permission held.
+            lastError = "Android refused the duty notification: " + (e.message ?: "")
+            false
+        }
+    }
+
+    /** Stop everything and leave the foreground state cleanly. */
+    private fun shutDown() {
+        stopTracking()
+        if (isForeground) {
+            runCatching {
+                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+            }
+            isForeground = false
+        }
+        stopSelf()
     }
 
     override fun onDestroy() {
@@ -153,12 +243,6 @@ class TelemetryService : Service() {
             PackageManager.PERMISSION_GRANTED
 
     private fun startTracking() {
-        if (!hasLocationPermission()) {
-            lastError = "Location permission not granted"
-            stopSelf()
-            return
-        }
-
         if (!startFusedUpdates()) {
             // Play Services is absent or unusable. LocationManager is always
             // there, so the app still works on a device without Google's
@@ -170,15 +254,22 @@ class TelemetryService : Service() {
         uploadJob = scope.launch {
             while (true) {
                 delay(UPLOAD_INTERVAL_MS)
-                flush()
+                try {
+                    flush()
+                } catch (e: Exception) {
+                    // One failed upload must not end the loop. The queue keeps
+                    // the fixes and the next tick tries again.
+                    lastError = e.message
+                }
             }
         }
     }
 
+    @SuppressLint("MissingPermission")
     private fun startFusedUpdates(): Boolean = try {
         val client = LocationServices.getFusedLocationProviderClient(this)
         val request = LocationRequest.Builder(
-            Priority.PRIORITY_BALANCED_POWER_ACCURACY,
+            Priority.PRIORITY_HIGH_ACCURACY,
             MOVING_INTERVAL_MS,
         )
             .setMinUpdateIntervalMillis(MOVING_INTERVAL_MS / 2)
@@ -191,6 +282,9 @@ class TelemetryService : Service() {
             }
         }
         client.requestLocationUpdates(request, callback, Looper.getMainLooper())
+        client.lastLocation.addOnSuccessListener { loc ->
+            if (loc != null) record(loc)
+        }
         fusedClient = client
         fusedCallback = callback
         true
@@ -199,24 +293,32 @@ class TelemetryService : Service() {
         false
     }
 
+    @SuppressLint("MissingPermission")
     private fun startLegacyUpdates() {
         try {
             val manager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
             val listener = LocationListener { location -> record(location) }
-            val provider = when {
-                manager.isProviderEnabled(LocationManager.GPS_PROVIDER) ->
-                    LocationManager.GPS_PROVIDER
-                manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER) ->
-                    LocationManager.NETWORK_PROVIDER
-                else -> null
+            var registered = false
+
+            if (manager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                manager.requestLocationUpdates(
+                    LocationManager.GPS_PROVIDER, MOVING_INTERVAL_MS, 0f, listener, Looper.getMainLooper()
+                )
+                manager.getLastKnownLocation(LocationManager.GPS_PROVIDER)?.let { record(it) }
+                registered = true
             }
-            if (provider == null) {
+            if (manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+                manager.requestLocationUpdates(
+                    LocationManager.NETWORK_PROVIDER, MOVING_INTERVAL_MS, 0f, listener, Looper.getMainLooper()
+                )
+                manager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)?.let { record(it) }
+                registered = true
+            }
+
+            if (!registered) {
                 lastError = "Location is switched off on this device"
                 return
             }
-            manager.requestLocationUpdates(
-                provider, MOVING_INTERVAL_MS, 25f, listener, Looper.getMainLooper()
-            )
             locationManager = manager
             legacyListener = listener
         } catch (e: SecurityException) {
@@ -242,6 +344,7 @@ class TelemetryService : Service() {
     // -- queueing ---------------------------------------------------------
 
     private fun record(location: Location) {
+        lastLocation = location
         val speedKph = if (location.hasSpeed()) location.speed * 3.6 else null
         val ping = QueuedPing(
             clientPingId = UUID.randomUUID().toString().take(16),
@@ -268,39 +371,47 @@ class TelemetryService : Service() {
 
         updateNotification(speedKph)
 
-        // Upload promptly while moving; let the batch accumulate when parked.
-        if (speedKph != null && speedKph > MOVING_SPEED_KPH && queue.size >= 5) {
-            scope.launch { flush() }
+        // Upload promptly so dispatch gets real-time position updates
+        scope.launch {
+            try {
+                flush()
+            } catch (e: Exception) {
+                lastError = e.message
+            }
         }
     }
 
     private suspend fun flush() {
-        val token = Session.token ?: return
+        try {
+            val token = Session.token ?: return
 
-        val batch: List<QueuedPing> = synchronized(queue) {
-            if (queue.isEmpty()) return
-            val take = minOf(BATCH_SIZE, queue.size)
-            (0 until take).mapNotNull { queue.pollFirst() }
-        }
-        if (batch.isEmpty()) return
-
-        val result = CargoResQApi.uploadPings(token, Session.deviceId, batch)
-        result.onSuccess {
-            lastUploadedAt = System.currentTimeMillis()
-            lastError = null
-            synchronized(queue) { queueDepth = queue.size }
-        }.onFailure { error ->
-            // Put them back at the front, oldest first, so nothing is lost to
-            // a transient outage. Order is preserved because the batch was
-            // taken from the front.
-            synchronized(queue) {
-                batch.asReversed().forEach { queue.addFirst(it) }
-                while (queue.size > QUEUE_LIMIT) {
-                    queue.pollFirst()
-                }
-                queueDepth = queue.size
+            val batch: List<QueuedPing> = synchronized(queue) {
+                if (queue.isEmpty()) return
+                val take = minOf(BATCH_SIZE, queue.size)
+                (0 until take).mapNotNull { queue.pollFirst() }
             }
-            lastError = error.message
+            if (batch.isEmpty()) return
+
+            val result = CargoResQApi.uploadPings(token, Session.deviceId, batch)
+            result.onSuccess {
+                lastUploadedAt = System.currentTimeMillis()
+                lastError = null
+                synchronized(queue) { queueDepth = queue.size }
+            }.onFailure { error ->
+                // Put them back at the front, oldest first, so nothing is lost to
+                // a transient outage. Order is preserved because the batch was
+                // taken from the front.
+                synchronized(queue) {
+                    batch.asReversed().forEach { queue.addFirst(it) }
+                    while (queue.size > QUEUE_LIMIT) {
+                        queue.pollFirst()
+                    }
+                    queueDepth = queue.size
+                }
+                lastError = error.message
+            }
+        } catch (e: Exception) {
+            lastError = e.message
         }
     }
 

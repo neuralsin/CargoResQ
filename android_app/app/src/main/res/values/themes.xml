@@ -1,31 +1,67 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
-    <style name="Theme.CargoResQ" parent="Theme.MaterialComponents.Light.NoActionBar">
-        <item name="colorPrimary">@color/ink</item>
-        <item name="colorPrimaryVariant">@color/black</item>
-        <item name="colorOnPrimary">@color/white</item>
-        <item name="colorSecondary">@color/teal</item>
-        <item name="colorSecondaryVariant">@color/teal_dark</item>
-        <item name="colorOnSecondary">@color/white</item>
-        <item name="colorError">@color/red</item>
+
+    <!--
+      AppCompat, not MaterialComponents.
+
+      Under a MaterialComponents theme, MaterialComponentsViewInflater swaps
+      every <Button> in every layout for a MaterialButton. MaterialButton
+      ignores android:background entirely and paints its own surface from
+      backgroundTint, which defaults to colorPrimary — so every pill button
+      in this app came out flat black once it had been drawn or pressed,
+      whatever drawable the layout asked for.
+
+      Nothing in this app uses a Material widget (no MaterialButton, no
+      TextInputLayout, no BottomSheet), so the Material theme was buying us
+      the swap and nothing else. AppCompat leaves <Button> as AppCompatButton,
+      which honours android:background, and our pill drawables work.
+    -->
+    <style name="Theme.CargoResQ" parent="Theme.AppCompat.Light.NoActionBar">
+        <item name="colorPrimary">@color/teal</item>
+        <item name="colorPrimaryDark">@color/teal_dark</item>
+        <item name="colorAccent">@color/teal</item>
+        <item name="colorControlNormal">@color/muted</item>
+        <item name="colorControlActivated">@color/teal</item>
+        <item name="colorControlHighlight">@color/teal_soft</item>
+        <item name="android:textColorPrimary">@color/ink</item>
+        <item name="android:textColorSecondary">@color/muted</item>
         <item name="android:statusBarColor">@color/white</item>
         <item name="android:windowLightStatusBar">true</item>
         <item name="android:navigationBarColor">@color/white</item>
         <item name="android:windowBackground">@color/canvas</item>
+        <item name="android:colorBackground">@color/canvas</item>
+
+        <!-- Plain buttons keep their own drawable and get no tint applied. -->
+        <item name="buttonStyle">@style/CargoButton</item>
     </style>
 
-    <style name="CargoText.Title" parent="TextAppearance.MaterialComponents.Headline6">
+    <style name="CargoButton" parent="Widget.AppCompat.Button">
+        <item name="android:background">@drawable/bg_pill_primary</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="android:stateListAnimator">@null</item>
+        <item name="android:letterSpacing">0</item>
+        <item name="backgroundTint">@null</item>
+        <item name="android:backgroundTint">@null</item>
+    </style>
+
+    <!--
+      Text appearances come from AppCompat rather than MaterialComponents.
+      The Material ones resolve ?attr/colorOnSurface, which does not exist in
+      an AppCompat theme and would fail to inflate at runtime.
+    -->
+    <style name="CargoText.Title" parent="TextAppearance.AppCompat.Title">
         <item name="android:textColor">@color/ink</item>
         <item name="android:textStyle">bold</item>
     </style>
 
-    <style name="CargoText.Body" parent="TextAppearance.MaterialComponents.Body2">
+    <style name="CargoText.Body" parent="TextAppearance.AppCompat.Body1">
         <item name="android:textColor">@color/muted</item>
     </style>
 
-    <style name="CargoText.Eyebrow" parent="TextAppearance.MaterialComponents.Overline">
+    <style name="CargoText.Eyebrow" parent="TextAppearance.AppCompat.Caption">
         <item name="android:textColor">@color/muted</item>
         <item name="android:textStyle">bold</item>
         <item name="android:textSize">10sp</item>
+        <item name="android:letterSpacing">0.08</item>
     </style>
 
     <style name="NavTab">

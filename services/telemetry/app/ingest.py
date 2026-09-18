@@ -195,33 +195,48 @@ async def _apply_live_state(
 
     findings = run_ingest_detectors(ping, previous)
 
-    # A position flagged as implausible or mocked is stored as history but is
-    # not allowed to become the truck's believed location -- otherwise a spoof
-    # both raises an alert and succeeds.
-    suspect = any(
-        f.alert_type in {AlertType.IMPOSSIBLE_JUMP, AlertType.MOCK_LOCATION}
-        for f in findings
+    # A fix that looks spoofed or physically impossible is recorded and
+    # flagged, not discarded.
+    #
+    # Dropping it meant the truck froze on the dispatcher's map at its last
+    # believed position. On an emulator, or any handset with developer options
+    # enabled, Android reports every fix as mocked -- so the truck stopped
+    # moving for good, while the operator had no idea the feed had stalled.
+    # A flagged position the dispatcher can question beats a stale one they
+    # cannot.
+    suspect_finding = next(
+        (
+            f
+            for f in findings
+            if f.alert_type in {AlertType.IMPOSSIBLE_JUMP, AlertType.MOCK_LOCATION}
+        ),
+        None,
     )
 
-    if not suspect:
-        moving, dwell_started, anchor_lat, anchor_lng = dwell_state(
-            live.latitude, live.longitude, live.dwell_started_at, ping
+    moving, dwell_started, anchor_lat, anchor_lng = dwell_state(
+        live.latitude, live.longitude, live.dwell_started_at, ping
+    )
+    was_dwelling = live.dwell_started_at is not None
+
+    live.latitude = ping["latitude"]
+    live.longitude = ping["longitude"]
+    live.speed_kph = ping.get("speed_kph")
+    live.heading_deg = ping.get("heading_deg")
+    live.is_moving = moving
+    live.dwell_started_at = dwell_started
+    live.dwell_anchor_lat = anchor_lat
+    live.dwell_anchor_lng = anchor_lng
+    live.position_suspect = suspect_finding is not None
+    live.suspect_reason = suspect_finding.alert_type.value if suspect_finding else None
+
+    truck.latitude = ping["latitude"]
+    truck.longitude = ping["longitude"]
+    position_updated = True
+
+    if moving and was_dwelling:
+        await auto_resolve(
+            session, truck.id, AlertType.DWELL, "Truck started moving again", commit=False
         )
-        was_dwelling = live.dwell_started_at is not None
-
-        live.latitude = ping["latitude"]
-        live.longitude = ping["longitude"]
-        live.speed_kph = ping.get("speed_kph")
-        live.heading_deg = ping.get("heading_deg")
-        live.is_moving = moving
-        live.dwell_started_at = dwell_started
-        live.dwell_anchor_lat = anchor_lat
-        live.dwell_anchor_lng = anchor_lng
-
-        if moving and was_dwelling:
-            await auto_resolve(
-                session, truck.id, AlertType.DWELL, "Truck started moving again", commit=False
-            )
 
     live.last_ping_id = None
     live.last_recorded_at = ping["recorded_at"]
@@ -233,6 +248,31 @@ async def _apply_live_state(
     await auto_resolve(
         session, truck.id, AlertType.GPS_STALE, "Telemetry resumed", commit=False
     )
+
+    if position_updated and event_publisher:
+        try:
+            rec_at = ping.get("recorded_at")
+            await event_publisher(
+                "telemetry.location",
+                {
+                    "companyId": truck.company_id,
+                    "truckId": truck.id,
+                    "driverId": driver.id,
+                    "latitude": float(ping["latitude"]),
+                    "longitude": float(ping["longitude"]),
+                    "speedKph": ping.get("speed_kph"),
+                    "headingDeg": ping.get("heading_deg"),
+                    "batteryPct": ping.get("battery_pct"),
+                    "registrationNumber": truck.registration_number,
+                    # Carried through so the dispatcher's map can mark the
+                    # position as unverified rather than silently trusting it.
+                    "positionSuspect": bool(live.position_suspect),
+                    "suspectReason": live.suspect_reason,
+                    "recordedAt": rec_at.isoformat() if hasattr(rec_at, "isoformat") else str(rec_at),
+                },
+            )
+        except Exception:
+            pass
 
     for finding in findings:
         alert, should_notify = await record_finding(
@@ -248,6 +288,45 @@ async def _apply_live_state(
 
     await session.commit()
     return len(findings)
+
+
+
+async def _may_report_condition(
+    session: AsyncSession, driver: Driver, shipment: Shipment
+) -> bool:
+    """Whether this driver is entitled to record this cargo's condition.
+
+    Normally that means their own company's load. But during a cross-carrier
+    rescue the cargo is physically in *another* company's truck, and that
+    driver is the only person who can read the gauge.
+
+    Refusing them was a real hole: on the exact scenario this product exists
+    for, no condition data could ever be recorded, so verification always
+    concluded INSUFFICIENT_DATA and the escrow could never release. The
+    carrier did the work and the funds stayed stuck.
+
+    Permission is scoped to a rescue that is actually bound -- being offered
+    a job, or having finished one, is not authority to write to its log.
+    """
+    if shipment.owner_company_id == driver.company_id:
+        return True
+
+    from services.orchestrator.app.offer_models import OfferState, RescueOffer
+
+    bound = await session.execute(
+        select(RescueOffer)
+        .where(RescueOffer.shipment_id == shipment.id)
+        .where(RescueOffer.carrier_company_id == driver.company_id)
+        .where(RescueOffer.state == OfferState.BOUND.value)
+    )
+    offer = bound.scalars().first()
+    if offer is None:
+        return False
+
+    # And only the driver whose truck is on the job.
+    if offer.carrier_truck_id and driver.assigned_truck_id:
+        return offer.carrier_truck_id == driver.assigned_truck_id
+    return True
 
 
 async def ingest_readings(
@@ -274,7 +353,9 @@ async def ingest_readings(
         shipment = shipments.get(shipment_id)
         if shipment is None:
             shipment = await session.get(Shipment, shipment_id)
-            if shipment is None or shipment.owner_company_id != driver.company_id:
+            if shipment is None or not await _may_report_condition(
+                session, driver, shipment
+            ):
                 rejected.append({"index": index, "reason": "shipment not found"})
                 continue
             shipments[shipment_id] = shipment

@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.location.Location
+import android.location.LocationListener
 import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
@@ -23,6 +24,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import com.cargoresq.driver.api.CargoResQApi
 import com.cargoresq.driver.model.*
 import com.cargoresq.driver.telemetry.TelemetryService
@@ -30,6 +32,13 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import android.os.Looper
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationResult
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
 import org.osmdroid.config.Configuration
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.GeoPoint
@@ -66,6 +75,12 @@ class MainActivity : AppCompatActivity() {
     private var lastKnownLocation: Location? = null
 
     private var homeMap: MapView? = null
+    private var mapFusedClient: FusedLocationProviderClient? = null
+    private var mapFusedCallback: LocationCallback? = null
+    private var mapLocationManager: LocationManager? = null
+    private var mapLocationListener: LocationListener? = null
+    /** Centre on the driver once, then leave the map where they put it. */
+    private var hasCentredOnce = false
     private var driverMarker: Marker? = null
     private var tickerJob: Job? = null
 
@@ -133,15 +148,33 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         homeMap?.onResume()
+
+        // onPause dropped the location subscription; pick it up again so the
+        // pin keeps following after the driver returns from another app.
+        val map = homeMap
+        val status = contentFrame.findViewById<TextView>(R.id.text_map_status)
+        if (map != null && status != null) {
+            startLocationTicker(map, status)
+        }
+
+        // Offers expire and responders commit while the app is in the
+        // background, so what is on screen is stale by definition.
+        if (Session.isSignedIn) {
+            loadEverything()
+        }
     }
 
     override fun onPause() {
+        // Stop consuming GPS the moment the screen is not showing it. The
+        // duty service keeps its own subscription; this one is only for the
+        // map the driver is looking at.
+        stopLocationTicker()
         homeMap?.onPause()
         super.onPause()
     }
 
     override fun onDestroy() {
-        tickerJob?.cancel()
+        stopLocationTicker()
         super.onDestroy()
     }
 
@@ -161,7 +194,10 @@ class MainActivity : AppCompatActivity() {
         currentTab = index
         updateNavStyles()
         contentFrame.removeAllViews()
+        stopLocationTicker()
         homeMap = null
+        driverMarker = null
+        hasCentredOnce = false
 
         val inflater = LayoutInflater.from(this)
         when (index) {
@@ -212,7 +248,21 @@ class MainActivity : AppCompatActivity() {
         val button = view.findViewById<Button>(R.id.btn_sign_in)
         val progress = view.findViewById<ProgressBar>(R.id.progress_auth)
 
-        baseUrlInput.setText(Session.baseUrl)
+        val presetUsb = view.findViewById<Button>(R.id.btn_preset_usb)
+        val presetWifi = view.findViewById<Button>(R.id.btn_preset_wifi)
+        val presetEmu = view.findViewById<Button>(R.id.btn_preset_emu)
+
+        presetUsb?.setOnClickListener { baseUrlInput.setText("http://127.0.0.1:8000") }
+        presetWifi?.setOnClickListener { baseUrlInput.setText("http://172.18.228.204:8000") }
+        presetEmu?.setOnClickListener { baseUrlInput.setText("http://10.0.2.2:8000") }
+
+        // If on real hardware and still pointing at emulator IP, default to Wi-Fi LAN
+        val initialUrl = if (Session.baseUrl == "http://10.0.2.2:8000" && !android.os.Build.FINGERPRINT.startsWith("generic")) {
+            "http://172.18.228.204:8000"
+        } else {
+            Session.baseUrl
+        }
+        baseUrlInput.setText(initialUrl)
 
         button.setOnClickListener {
             val email = emailInput.text.toString().trim()
@@ -223,7 +273,20 @@ class MainActivity : AppCompatActivity() {
                 return@setOnClickListener
             }
 
-            Session.baseUrl = baseUrlInput.text.toString().trim()
+            val rawUrl = baseUrlInput.text.toString().trim()
+            if (rawUrl.isEmpty()) {
+                errorText.text = "Enter the server address (e.g. http://172.18.228.204:8000)."
+                errorText.visibility = View.VISIBLE
+                return@setOnClickListener
+            }
+            val cleanUrl = CargoResQApi.sanitizeBaseUrl(rawUrl)
+            if (cleanUrl.toHttpUrlOrNull() == null) {
+                errorText.text = "Invalid server address: $rawUrl. Include valid host and port."
+                errorText.visibility = View.VISIBLE
+                return@setOnClickListener
+            }
+
+            Session.baseUrl = cleanUrl
             errorText.visibility = View.GONE
             button.isEnabled = false
             progress.visibility = View.VISIBLE
@@ -237,10 +300,14 @@ class MainActivity : AppCompatActivity() {
                     Session.save(session)
                     showApp()
                 }.onFailure { error ->
-                    // A real failure, shown as one. The previous build
-                    // returned a fabricated session here and let the driver
-                    // believe they were signed in.
-                    errorText.text = error.message ?: "Sign in failed."
+                    val tip = if (cleanUrl.contains("10.0.2.2")) {
+                        "\nTip: 10.0.2.2 only works inside Android Emulator. On a phone, tap 'Wi-Fi' or 'USB' above."
+                    } else if (cleanUrl.contains("127.0.0.1") || cleanUrl.contains("localhost")) {
+                        "\nTip: For USB connection, run connect_phone_usb.bat (adb reverse tcp:8000 tcp:8000) on your PC."
+                    } else {
+                        "\nTip: Ensure your PC backend is running and both devices share the same network."
+                    }
+                    errorText.text = (error.message ?: "Sign in failed.") + tip
                     errorText.visibility = View.VISIBLE
                 }
             }
@@ -279,8 +346,30 @@ class MainActivity : AppCompatActivity() {
             if (emergencyNumbers.isEmpty()) {
                 CargoResQApi.emergencyNumbers().onSuccess { emergencyNumbers = it }
             }
-            if (currentTab == TAB_HOME) switchTab(TAB_HOME) else switchTab(currentTab)
+            if (currentTab == TAB_HOME && homeMap != null) {
+                updateHomeFields()
+            } else {
+                switchTab(currentTab)
+            }
             onDone?.invoke()
+        }
+    }
+
+    private fun updateHomeFields() {
+        val root = if (contentFrame.childCount > 0) contentFrame.getChildAt(0) else return
+        root.findViewById<TextView>(R.id.text_driver_name)?.text =
+            profile?.name ?: Session.current?.driverName ?: "Driver"
+        val truck = profile?.truck
+        root.findViewById<TextView>(R.id.text_truck_summary)?.text = when {
+            truck == null -> "No truck assigned"
+            truck.refrigerated -> truck.registrationNumber + " - reefer"
+            else -> truck.registrationNumber
+        }
+        val dutyBadge = root.findViewById<TextView>(R.id.badge_duty)
+        val dutyButton = root.findViewById<Button>(R.id.btn_duty_toggle)
+        val telemetryStatus = root.findViewById<TextView>(R.id.text_telemetry_status)
+        if (dutyBadge != null && dutyButton != null && telemetryStatus != null) {
+            renderDutyState(dutyBadge, dutyButton, telemetryStatus)
         }
     }
 
@@ -448,30 +537,124 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun placeDriverMarker(map: MapView, point: GeoPoint) {
-        driverMarker?.let { map.overlays.remove(it) }
-        val marker = Marker(map).apply {
-            position = point
-            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-            title = profile?.truck?.registrationNumber ?: "You"
+        try {
+            val existing = driverMarker
+            if (existing != null && map.overlays.contains(existing)) {
+                existing.position = point
+            } else {
+                val marker = Marker(map).apply {
+                    position = point
+                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                    title = profile?.truck?.registrationNumber ?: "You"
+                }
+                map.overlays.add(marker)
+                driverMarker = marker
+            }
+            map.invalidate()
+        } catch (e: Exception) {
+            // Ignore concurrent draw errors
         }
-        map.overlays.add(marker)
-        driverMarker = marker
-        map.invalidate()
     }
 
     /** Follow the device's position on the map while the screen is open. */
+    /**
+     * Keep the pin on the driver's actual position while the map is visible.
+     *
+     * Subscribes to live fixes rather than re-reading the last known one on a
+     * timer. getLastKnownLocation returns whatever the system happens to have
+     * cached, which off duty can be hours old and never changes -- so the pin
+     * sat still while the driver drove, which is precisely the thing a map is
+     * for.
+     *
+     * This runs whether or not the driver is on duty. Showing someone where
+     * they are is not the same as reporting it to their employer: nothing
+     * here uploads anything.
+     */
+    @SuppressLint("MissingPermission")
     private fun startLocationTicker(map: MapView, status: TextView) {
-        tickerJob?.cancel()
-        tickerJob = lifecycleScope.launch {
-            while (isActive) {
-                delay(5_000)
-                val location = readLastKnownLocation() ?: continue
-                lastKnownLocation = location
-                val point = GeoPoint(location.latitude, location.longitude)
-                placeDriverMarker(map, point)
-                status.text = if (onDuty) "Sharing your position" else "Your position"
+        stopLocationTicker()
+
+        if (!hasLocationPermission()) {
+            status.text = "Allow location to see yourself on the map"
+            return
+        }
+
+        val onFix: (Location) -> Unit = { location ->
+            lastKnownLocation = location
+            val point = GeoPoint(location.latitude, location.longitude)
+            placeDriverMarker(map, point)
+            if (!hasCentredOnce) {
+                map.controller.animateTo(point)
+                map.controller.setZoom(16.0)
+                hasCentredOnce = true
+            }
+            status.text = when {
+                onDuty -> "Sharing your position"
+                else -> "Your position"
             }
         }
+
+        // Fused where Play Services exists; LocationManager otherwise, so the
+        // map still follows on a device without Google's services.
+        val started = try {
+            val client = LocationServices.getFusedLocationProviderClient(this)
+            val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 3_000L)
+                .setMinUpdateIntervalMillis(2_000L)
+                .build()
+            val callback = object : LocationCallback() {
+                override fun onLocationResult(result: LocationResult) {
+                    result.lastLocation?.let(onFix)
+                }
+            }
+            client.requestLocationUpdates(request, callback, Looper.getMainLooper())
+            mapFusedClient = client
+            mapFusedCallback = callback
+            true
+        } catch (e: Exception) {
+            false
+        }
+
+        if (!started) {
+            try {
+                val manager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+                val provider = when {
+                    manager.isProviderEnabled(LocationManager.GPS_PROVIDER) ->
+                        LocationManager.GPS_PROVIDER
+                    manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER) ->
+                        LocationManager.NETWORK_PROVIDER
+                    else -> null
+                }
+                if (provider == null) {
+                    status.text = "Location is switched off on this phone"
+                } else {
+                    val listener = LocationListener { onFix(it) }
+                    manager.requestLocationUpdates(provider, 3_000L, 5f, listener,
+                        Looper.getMainLooper())
+                    mapLocationManager = manager
+                    mapLocationListener = listener
+                }
+            } catch (e: Exception) {
+                status.text = "Could not start location updates"
+            }
+        }
+
+        // Show something immediately rather than waiting for the first fix.
+        readLastKnownLocation()?.let(onFix)
+    }
+
+    private fun stopLocationTicker() {
+        tickerJob?.cancel()
+        tickerJob = null
+        mapFusedCallback?.let { callback ->
+            runCatching { mapFusedClient?.removeLocationUpdates(callback) }
+        }
+        mapFusedCallback = null
+        mapFusedClient = null
+        mapLocationListener?.let { listener ->
+            runCatching { mapLocationManager?.removeUpdates(listener) }
+        }
+        mapLocationListener = null
+        mapLocationManager = null
     }
 
     private fun recentreMap() {
@@ -486,6 +669,8 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("MissingPermission")
     private fun readLastKnownLocation(): Location? {
+        val fromService = TelemetryService.lastLocation
+        if (fromService != null) return fromService
         if (!hasLocationPermission()) return null
         return try {
             val manager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
@@ -530,7 +715,34 @@ class MainActivity : AppCompatActivity() {
         TelemetryService.start(this)
         onDuty = true
         toast("On duty. Dispatch can see your position.")
-        if (currentTab == TAB_HOME) switchTab(TAB_HOME)
+        if (currentTab == TAB_HOME && homeMap != null) {
+            updateHomeFields()
+        } else {
+            switchTab(TAB_HOME)
+        }
+
+        // Transmit initial beacon fix immediately
+        val location = readLastKnownLocation()
+        val token = Session.token
+        if (location != null && token != null) {
+            lastKnownLocation = location
+            homeMap?.let { placeDriverMarker(it, GeoPoint(location.latitude, location.longitude)) }
+            lifecycleScope.launch {
+                val ping = QueuedPing(
+                    clientPingId = UUID.randomUUID().toString().take(16),
+                    recordedAt = isoFormat.format(Date(location.time)),
+                    latitude = location.latitude,
+                    longitude = location.longitude,
+                    accuracyM = if (location.hasAccuracy()) location.accuracy else null,
+                    speedKph = if (location.hasSpeed()) location.speed * 3.6 else 0.0,
+                    headingDeg = if (location.hasBearing()) location.bearing.toDouble() else null,
+                    batteryPct = null,
+                    isCharging = null,
+                    mockLocation = false,
+                )
+                CargoResQApi.uploadPings(token, Session.deviceId, listOf(ping))
+            }
+        }
     }
 
     private fun stopDuty() {
@@ -893,6 +1105,8 @@ class MainActivity : AppCompatActivity() {
             )
 
             result.onSuccess { alert ->
+                onDuty = true
+                TelemetryService.start(this@MainActivity)
                 resultText.visibility = View.VISIBLE
                 resultText.setTextColor(ContextCompat.getColor(this@MainActivity, R.color.teal))
                 resultText.text =
