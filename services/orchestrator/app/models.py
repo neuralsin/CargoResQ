@@ -7,7 +7,7 @@ import enum
 import uuid
 from typing import Dict, Any, List
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy import String, Float, DateTime, ForeignKey, Enum as SAEnum, JSON, func
+from sqlalchemy import String, Float, DateTime, ForeignKey, Enum as SAEnum, JSON, func, text
 
 
 from shared.database import Base
@@ -40,8 +40,21 @@ TRANSITIONS = {
         IncidentState.MATCHING,
         IncidentState.CANCELLED,
     },
-    IncidentState.RESCUE_ACCEPTED: {IncidentState.DRIVER_EN_ROUTE, IncidentState.CANCELLED},
-    IncidentState.DRIVER_EN_ROUTE: {IncidentState.CARGO_TRANSFER, IncidentState.CANCELLED},
+    # MATCHING is reachable again from here: a bound rescue can fall through
+    # -- the rescuer breaks down too, or the owner stands the job down -- and
+    # the cargo is then stranded exactly as it was before. Without this edge a
+    # failed rescue left the incident wedged in RESCUE_ACCEPTED forever, with
+    # no way to look for anyone else.
+    IncidentState.RESCUE_ACCEPTED: {
+        IncidentState.DRIVER_EN_ROUTE,
+        IncidentState.MATCHING,
+        IncidentState.CANCELLED,
+    },
+    IncidentState.DRIVER_EN_ROUTE: {
+        IncidentState.CARGO_TRANSFER,
+        IncidentState.MATCHING,
+        IncidentState.CANCELLED,
+    },
     IncidentState.CARGO_TRANSFER: {IncidentState.RESCUE_IN_TRANSIT, IncidentState.CANCELLED},
     IncidentState.RESCUE_IN_TRANSIT: {IncidentState.DELIVERED, IncidentState.CANCELLED},
     IncidentState.DELIVERED: {IncidentState.VERIFICATION},
@@ -59,8 +72,20 @@ class Incident(Base):
         String(64), primary_key=True, default=lambda: f"inc_{uuid.uuid4().hex[:10]}"
     )
     shipment_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # See Truck.status: VARCHAR + CHECK, not a native PostgreSQL ENUM.
     state: Mapped[IncidentState] = mapped_column(
-        SAEnum(IncidentState), default=IncidentState.NORMAL, nullable=False
+        SAEnum(
+            IncidentState,
+            native_enum=False,
+            length=32,
+            validate_strings=True,
+            create_constraint=True,
+            name="chk_incident_state",
+        ),
+        default=IncidentState.NORMAL,
+        server_default=IncidentState.NORMAL.value,
+        nullable=False,
+        index=True,
     )
     assigned_truck_id: Mapped[str] = mapped_column(String(64), nullable=True)
     lat: Mapped[float] = mapped_column(Float, nullable=False)
@@ -91,7 +116,9 @@ class IncidentEvent(Base):
     actor_id: Mapped[str] = mapped_column(String(64), nullable=True)
     previous_state: Mapped[str] = mapped_column(String(32), nullable=True)
     new_state: Mapped[str] = mapped_column(String(32), nullable=True)
-    metadata_json: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[Dict[str, Any]] = mapped_column(
+        JSON, default=dict, server_default=text("'{}'"), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

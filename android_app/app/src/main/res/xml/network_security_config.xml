@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Release configuration: HTTPS only.
+
+  The previous manifest set usesCleartextTraffic="true" application-wide,
+  which permitted an unencrypted connection to any host on the internet,
+  including the production API and therefore every driver credential and
+  position sent to it.
+
+  The debug build overrides this file (see src/debug/res/xml/) to allow
+  cleartext, so a driver can point the app at a laptop on the same Wi-Fi
+  during a pilot without that permission ever shipping to Play.
+
+  Note: Android's domain-config matches host names and exact addresses, not
+  CIDR ranges -- there is no way to express "any RFC1918 address" here, which
+  is precisely why LAN testing belongs in the debug variant.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

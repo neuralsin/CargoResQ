@@ -1,7 +1,8 @@
-"""
-Database Engine & Async Session Management (Phase 1).
-Delegates to unified shared.database for zero-config hosting and unified data models.
-"""
-from shared.database import engine, async_session, get_db, init_database as init_db
+"""Re-export of the shared engine and session factory.
 
-__all__ = ["engine", "async_session", "get_db", "init_db"]
+Kept so that the core_api modules can use relative imports. The schema itself
+is managed by Alembic via shared.schema, not from here.
+"""
+from shared.database import async_session, engine, get_db
+
+__all__ = ["engine", "async_session", "get_db"]

@@ -67,8 +67,8 @@ async def get_current_company(token: str = Depends(oauth2_scheme)) -> str:
         payload = jwt.decode(
             token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
         )
-        company_id: str = payload.get("company_id")
-        if not company_id:
+        company_id = payload.get("company_id")
+        if not company_id or not isinstance(company_id, str):
             raise credentials_exception
         return company_id
     except JWTError:
@@ -95,3 +95,33 @@ async def get_current_driver(principal: Dict[str, Any] = Depends(get_current_pri
     if principal.get("principal_type") != "driver" or not principal.get("principal_id"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Driver access required")
     return principal
+
+
+async def get_current_company_principal(
+    principal: Dict[str, Any] = Depends(get_current_principal),
+) -> Dict[str, Any]:
+    """Require a company-staff token (as opposed to a driver's device token)."""
+    if principal.get("principal_type") != "company":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Company operator access required",
+        )
+    return principal
+
+
+def actor_id_of(principal: Dict[str, Any]) -> str:
+    """The audit-trail actor for a principal.
+
+    Derived from the verified token, never from a request body -- `actor_id`
+    used to be a free-text field defaulting to the literal "ops".
+    """
+    return str(principal.get("principal_id") or principal.get("sub") or "unknown")
+
+
+def decode_token(token: str) -> Dict[str, Any]:
+    """Decode and validate a JWT outside of a request dependency.
+
+    Used by the WebSocket handshake, which cannot use Depends().
+    Raises JWTError on any failure.
+    """
+    return jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])

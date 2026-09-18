@@ -9,7 +9,9 @@
     "${workspaceFolder}/services/pricing_engine",
     "${workspaceFolder}/services/escrow_ledger",
     "${workspaceFolder}/services/realtime_gateway",
-    "${workspaceFolder}/services/orchestrator"
+    "${workspaceFolder}/services/orchestrator",
+    "${workspaceFolder}/services/sos",
+    "${workspaceFolder}/services/telemetry"
   ],
   "python.autoComplete.extraPaths": [
     "C:\\Users\\shaan\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\site-packages",

@@ -15,8 +15,8 @@ from sqlalchemy import (
     Enum as SAEnum,
     DateTime,
     CheckConstraint,
-    UniqueConstraint,
     func,
+    text,
 )
 
 
@@ -31,9 +31,9 @@ class TruckStatus(str, enum.Enum):
 
 class Company(Base):
     __tablename__ = "companies"
-    __table_args__ = (
-        UniqueConstraint("email", name="uq_company_email"),
-    )
+    # `email` already declares unique=True, index=True, which emits a unique
+    # index. A second table-level UniqueConstraint on the same column is
+    # redundant and showed up permanently as schema drift.
 
     id: Mapped[str] = mapped_column(
         String(64), primary_key=True, default=lambda: f"comp_{uuid.uuid4().hex[:8]}"
@@ -41,8 +41,12 @@ class Company(Base):
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     email: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
     hashed_password: Mapped[str] = mapped_column(String(256), nullable=False)
-    role: Mapped[str] = mapped_column(String(32), default="CARRIER_OWNER")
-    trust_score: Mapped[float] = mapped_column(Float, default=100.0)
+    role: Mapped[str] = mapped_column(
+        String(32), default="CARRIER_OWNER", server_default="CARRIER_OWNER", nullable=False
+    )
+    trust_score: Mapped[float] = mapped_column(
+        Float, default=100.0, server_default="100.0", nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -61,8 +65,7 @@ class Company(Base):
 class Driver(Base):
     """A field operator identity used by the dedicated driver app."""
 
-    __tablename__ = "drivers"
-    __table_args__ = (UniqueConstraint("email", name="uq_driver_email"),)
+    __tablename__ = "drivers"  # see Company.email re: unique index
 
     id: Mapped[str] = mapped_column(
         String(64), primary_key=True, default=lambda: f"drv_{uuid.uuid4().hex[:8]}"
@@ -75,7 +78,9 @@ class Driver(Base):
     hashed_password: Mapped[str] = mapped_column(String(256), nullable=False)
     phone: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     assigned_truck_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
-    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    active: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("1"), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -86,7 +91,7 @@ class Driver(Base):
 class Truck(Base):
     __tablename__ = "trucks"
     __table_args__ = (
-        UniqueConstraint("registration_number", name="uq_truck_registration"),
+        # registration_number declares unique=True, index=True already.
         CheckConstraint("max_volume_m3 > 0", name="chk_truck_volume_positive"),
         CheckConstraint("max_weight_kg > 0", name="chk_truck_weight_positive"),
     )
@@ -102,12 +107,30 @@ class Truck(Base):
     )
     latitude: Mapped[float] = mapped_column(Float, nullable=False)
     longitude: Mapped[float] = mapped_column(Float, nullable=False)
+    # native_enum=False stores a VARCHAR with a CHECK constraint rather than a
+    # PostgreSQL ENUM type. Python still sees TruckStatus; the database stays
+    # portable and needs no type migration when a status is added.
     status: Mapped[TruckStatus] = mapped_column(
-        SAEnum(TruckStatus), default=TruckStatus.idle, nullable=False, index=True
+        SAEnum(
+            TruckStatus,
+            native_enum=False,
+            length=32,
+            validate_strings=True,
+            create_constraint=True,
+            name="chk_truck_status",
+        ),
+        default=TruckStatus.idle,
+        server_default=TruckStatus.idle.value,
+        nullable=False,
+        index=True,
     )
-    refrigerated: Mapped[bool] = mapped_column(Boolean, default=False)
+    refrigerated: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0"), nullable=False
+    )
     min_temp_c: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    hazmat_certified: Mapped[bool] = mapped_column(Boolean, default=False)
+    hazmat_certified: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0"), nullable=False
+    )
     max_volume_m3: Mapped[float] = mapped_column(Float, nullable=False)
     max_weight_kg: Mapped[float] = mapped_column(Float, nullable=False)
 
@@ -121,6 +144,14 @@ class Shipment(Base):
         CheckConstraint("volume_m3 > 0", name="chk_shipment_volume_positive"),
         CheckConstraint("weight_kg > 0", name="chk_shipment_weight_positive"),
         CheckConstraint("value_inr >= 0", name="chk_shipment_value_nonneg"),
+        CheckConstraint(
+            "destination_lat IS NULL OR destination_lat BETWEEN -90 AND 90",
+            name="chk_shipment_dest_lat_range",
+        ),
+        CheckConstraint(
+            "destination_lng IS NULL OR destination_lng BETWEEN -180 AND 180",
+            name="chk_shipment_dest_lng_range",
+        ),
     )
 
     id: Mapped[str] = mapped_column(
@@ -133,13 +164,32 @@ class Shipment(Base):
         ForeignKey("trucks.id", ondelete="SET NULL"), nullable=True, index=True
     )
     cargo_type: Mapped[str] = mapped_column(String(128), nullable=False)
-    requires_refrigeration: Mapped[bool] = mapped_column(Boolean, default=False)
+    requires_refrigeration: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0"), nullable=False
+    )
     required_max_temp_c: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    is_hazmat: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_hazmat: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0"), nullable=False
+    )
     volume_m3: Mapped[float] = mapped_column(Float, nullable=False)
     weight_kg: Mapped[float] = mapped_column(Float, nullable=False)
     value_inr: Mapped[float] = mapped_column(Float, nullable=False)
-    status: Mapped[str] = mapped_column(String(32), default="in_transit")
+    status: Mapped[str] = mapped_column(
+        String(32), default="in_transit", server_default="in_transit", nullable=False
+    )
+
+    # Where the load is going. Absent until now, which is why "route
+    # alignment" in the matching score had to be a hardcoded constant and
+    # route-deviation detection was impossible -- there was no route.
+    origin_lat: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    origin_lng: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    destination_lat: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    destination_lng: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    destination_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    planned_arrival_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

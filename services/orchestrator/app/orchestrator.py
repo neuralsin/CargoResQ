@@ -82,10 +82,15 @@ async def advance(
     actor_id: str,
     metadata: Optional[Dict[str, Any]] = None,
     event_publisher: Optional[Callable[[str, dict], Awaitable[None]]] = None,
+    commit: bool = True,
 ) -> Incident:
-    """
-    Validates and advances the incident lifecycle.
-    Guarantees atomic persistence of state update + append-only audit event.
+    """Validate and advance the incident lifecycle.
+
+    The state update and its append-only audit event are always written
+    together. Pass ``commit=False`` to fold this into a larger unit of work --
+    binding a rescue has to move the incident, create the escrow and expire
+    the sibling offers atomically, and a commit in the middle of that would
+    leave a half-bound rescue behind if the rest failed.
     """
     incident = await session.get(Incident, incident_id)
     if not incident:
@@ -114,8 +119,11 @@ async def advance(
         metadata_json=metadata or {},
     )
     session.add(audit_event)
-    await session.commit()
-    await session.refresh(incident)
+    if commit:
+        await session.commit()
+        await session.refresh(incident)
+    else:
+        await session.flush()
 
     logger.info(
         "incident_advanced",

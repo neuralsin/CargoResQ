@@ -1,18 +1,32 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  The same tokens as the desktop console (desktop_app/theme.py), so a
+  dispatcher and a driver looking at the same rescue see the same colours.
+
+  These were previously transcribed by hand and had drifted: every neutral was
+  off by a digit or two, and `red` was Uber's brand red (#E11900) rather than
+  the restrained #B42318 the console uses. On a full-bleed SOS surface that
+  difference is very visible.
+-->
 <resources>
-    <color name="uber_black">#101615</color>
-    <color name="uber_pure_black">#000000</color>
-    <color name="uber_white">#FFFFFF</color>
-    <color name="uber_canvas">#F6F8F7</color>
-    <color name="uber_surface">#FFFFFF</color>
-    <color name="uber_card_stroke">#E5EAE7</color>
-    <color name="uber_gray_light">#F0F3F2</color>
-    <color name="uber_gray_muted">#7B8683</color>
-    <color name="uber_teal">#0F766E</color>
-    <color name="uber_teal_soft">#E4F3EF</color>
-    <color name="uber_red">#E11900</color>
-    <color name="uber_red_soft">#FDEBE8</color>
-    <color name="uber_amber">#B7791F</color>
-    <color name="uber_amber_soft">#FFF3D6</color>
-    <color name="uber_pill_dark">#101615</color>
+    <color name="ink">#101615</color>
+    <color name="muted">#6F7B78</color>
+    <color name="line">#E4EAE7</color>
+    <color name="canvas">#F5F7F6</color>
+    <color name="card">#FFFFFF</color>
+    <color name="row">#FBFCFB</color>
+
+    <color name="teal">#0F766E</color>
+    <color name="teal_dark">#0A5C56</color>
+    <color name="teal_soft">#E5F3F0</color>
+
+    <color name="amber">#B7791F</color>
+    <color name="amber_soft">#FFF4D8</color>
+
+    <color name="red">#B42318</color>
+    <color name="red_dark">#8F1C13</color>
+    <color name="red_soft">#FDECEA</color>
+
+    <color name="white">#FFFFFF</color>
+    <color name="black">#000000</color>
 </resources>

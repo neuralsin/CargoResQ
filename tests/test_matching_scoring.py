@@ -25,16 +25,40 @@ def test_rescue_score_differentiation():
         "fullyCompatible": False,
         "requiredVolumeM3": 3.0,
         "availableVolumeM3": 1.0,
-        "companyTrustScore": 70.0,
-        "historicalAcceptanceRate": 0.50,
+        "companyTrustScore": 45.0,
+        "historicalAcceptanceRate": 0.15,
         "routeAlignmentScore": 0.2,
     }
     score_poor = calculate_rescue_score(poor_candidate)
 
     assert score_good.total > score_poor.total
     assert len(score_good.reasons) > 0
-    assert any("min ETA" in r for r in score_good.reasons)
-    assert any("Fully compatible" in r for r in score_good.reasons)
+    # Reasons must reflect the actual figures. They used to be emitted from
+    # hardcoded inputs, so every candidate claimed a 95% success rate.
+    assert any("min away" in r for r in score_good.reasons)
+    assert any("Trust score 98" in r for r in score_good.reasons)
+    assert any("Accepts 96%" in r for r in score_good.reasons)
+    assert any("heading toward" in r for r in score_good.reasons)
+
+    # The weaker candidate is described as weak, not flattered.
+    assert any("Rarely accepts" in r or "Low trust" in r for r in score_poor.reasons)
+    assert not any("Trust score 9" in r for r in score_poor.reasons)
+
+
+def test_unknown_carrier_scores_neutral_not_perfect():
+    """A carrier we know nothing about must not score like a proven one."""
+    known = calculate_rescue_score({
+        "etaMinutes": 15, "maxAcceptableEtaMinutes": 60, "fullyCompatible": True,
+        "requiredVolumeM3": 3.0, "availableVolumeM3": 8.0,
+        "companyTrustScore": 98.0, "historicalAcceptanceRate": 0.96,
+        "routeAlignmentScore": 0.9,
+    })
+    # Same truck, same distance, but no history at all -- defaults apply.
+    unknown = calculate_rescue_score({
+        "etaMinutes": 15, "maxAcceptableEtaMinutes": 60, "fullyCompatible": True,
+        "requiredVolumeM3": 3.0, "availableVolumeM3": 8.0,
+    })
+    assert unknown.total < known.total
 
 
 def test_spoilage_margin_classification_boundaries():
