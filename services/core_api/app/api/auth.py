@@ -4,7 +4,7 @@ Register new carrier companies and issue signed JWT access tokens.
 """
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from ..database import get_db
@@ -17,7 +17,7 @@ router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 class RegisterCompanyRequest(BaseModel):
     name: str
     email: EmailStr
-    password: str
+    password: str = Field(..., min_length=8)
     role: str = "CARRIER_OWNER"
 
 

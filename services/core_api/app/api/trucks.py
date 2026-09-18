@@ -16,8 +16,8 @@ router = APIRouter(prefix="/api/v1/trucks", tags=["trucks"])
 
 class CreateTruckRequest(BaseModel):
     registration_number: str = Field(..., min_length=3)
-    latitude: float
-    longitude: float
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
     status: TruckStatus = TruckStatus.idle
     refrigerated: bool = False
     min_temp_c: Optional[float] = None

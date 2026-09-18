@@ -25,4 +25,8 @@ jobs:
 
     - name: Run test suite
       run: |
-        pytest -v
+        python -m pytest -v
+
+    - name: Compile Python sources
+      run: |
+        python -m compileall -q main.py shared services

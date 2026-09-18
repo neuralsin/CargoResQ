@@ -5,6 +5,7 @@ from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from .models import IncidentState, Incident
 from .orchestrator import (
     create_incident,
@@ -16,6 +17,9 @@ from .orchestrator import (
 from .sla import compute_sla
 from .trust import compute_trust_score
 from shared.database import get_db
+from services.core_api.app.auth import get_current_company
+from services.core_api.app.events.producer import event_producer
+from services.core_api.app.models import Shipment
 
 router = APIRouter(prefix="/api/v1", tags=["orchestrator"])
 
@@ -49,6 +53,7 @@ async def create_new_incident(req: CreateIncidentRequest, db: AsyncSession = Dep
         lng=req.lng,
         minutes_until_spoilage=req.minutes_until_spoilage,
         actor_id=req.actor_id,
+        event_publisher=event_producer.publish,
     )
     return {
         "id": incident.id,
@@ -59,6 +64,38 @@ async def create_new_incident(req: CreateIncidentRequest, db: AsyncSession = Dep
         "minutesUntilSpoilage": incident.minutes_until_spoilage,
         "createdAt": incident.created_at.isoformat() if incident.created_at else None,
     }
+
+
+@router.get("/incidents")
+async def list_company_incidents(
+    limit: int = 50,
+    company_id: str = Depends(get_current_company),
+    db: AsyncSession = Depends(get_db),
+):
+    """Operations feed scoped to the authenticated carrier company."""
+    limit = min(max(limit, 1), 100)
+    result = await db.execute(
+        select(Incident, Shipment)
+        .join(Shipment, Shipment.id == Incident.shipment_id)
+        .where(Shipment.owner_company_id == company_id)
+        .order_by(Incident.created_at.desc())
+        .limit(limit)
+    )
+    return [
+        {
+            "id": incident.id,
+            "shipmentId": incident.shipment_id,
+            "cargoType": shipment.cargo_type,
+            "state": incident.state.value,
+            "assignedTruckId": incident.assigned_truck_id,
+            "lat": incident.lat,
+            "lng": incident.lng,
+            "minutesUntilSpoilage": incident.minutes_until_spoilage,
+            "createdAt": incident.created_at.isoformat() if incident.created_at else None,
+            "updatedAt": incident.updated_at.isoformat() if incident.updated_at else None,
+        }
+        for incident, shipment in result.all()
+    ]
 
 
 @router.post("/incidents/{id}/advance")
@@ -72,6 +109,7 @@ async def advance_incident_state(
             new_state=req.new_state,
             actor_id=req.actor_id,
             metadata=req.metadata,
+            event_publisher=event_producer.publish,
         )
         return {
             "id": incident.id,

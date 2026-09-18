@@ -14,6 +14,7 @@ from .api.companies import router as companies_router
 from .api.trucks import router as trucks_router
 from .api.shipments import router as shipments_router
 from .api.simulation import router as simulation_router
+from .api.driver import router as driver_router
 from shared.observability import configure_logging, metrics_endpoint_response
 
 configure_logging()
@@ -46,6 +47,7 @@ app.include_router(trucks_router)
 app.include_router(shipments_router)
 app.include_router(breakdowns_router)
 app.include_router(simulation_router)
+app.include_router(driver_router)
 
 
 @app.on_event("startup")

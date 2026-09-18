@@ -53,6 +53,34 @@ class Company(Base):
     shipments: Mapped[List["Shipment"]] = relationship(
         back_populates="company", cascade="all, delete-orphan"
     )
+    drivers: Mapped[List["Driver"]] = relationship(
+        back_populates="company", cascade="all, delete-orphan"
+    )
+
+
+class Driver(Base):
+    """A field operator identity used by the dedicated driver app."""
+
+    __tablename__ = "drivers"
+    __table_args__ = (UniqueConstraint("email", name="uq_driver_email"),)
+
+    id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=lambda: f"drv_{uuid.uuid4().hex[:8]}"
+    )
+    company_id: Mapped[str] = mapped_column(
+        ForeignKey("companies.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    email: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
+    hashed_password: Mapped[str] = mapped_column(String(256), nullable=False)
+    phone: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    assigned_truck_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    company: Mapped["Company"] = relationship(back_populates="drivers")
 
 
 class Truck(Base):

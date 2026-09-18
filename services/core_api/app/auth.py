@@ -3,7 +3,7 @@ JWT Authentication & Multi-Tenant Company Isolation (Phase 1.5).
 Enforces company data boundaries at the repository query level, not just in the UI.
 """
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Dict, Optional
 from jose import jwt, JWTError
 import bcrypt
 from fastapi import Depends, HTTPException, status
@@ -32,6 +32,8 @@ def create_access_token(
     company_id: str,
     role: str = "CARRIER_OWNER",
     expires_delta: Optional[timedelta] = None,
+    principal_type: str = "company",
+    principal_id: Optional[str] = None,
 ) -> str:
     if expires_delta:
         expire = datetime.now(timezone.utc) + expires_delta
@@ -44,6 +46,8 @@ def create_access_token(
         "sub": subject,
         "company_id": company_id,
         "role": role,
+        "principal_type": principal_type,
+        "principal_id": principal_id or subject,
         "exp": expire,
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
@@ -69,3 +73,25 @@ async def get_current_company(token: str = Depends(oauth2_scheme)) -> str:
         return company_id
     except JWTError:
         raise credentials_exception
+
+
+async def get_current_principal(token: str = Depends(oauth2_scheme)) -> Dict[str, Any]:
+    """Decode a token once for driver and company-scoped endpoints."""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+        if not payload.get("company_id") or not payload.get("sub"):
+            raise credentials_exception
+        return payload
+    except JWTError:
+        raise credentials_exception
+
+
+async def get_current_driver(principal: Dict[str, Any] = Depends(get_current_principal)) -> Dict[str, Any]:
+    if principal.get("principal_type") != "driver" or not principal.get("principal_id"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Driver access required")
+    return principal

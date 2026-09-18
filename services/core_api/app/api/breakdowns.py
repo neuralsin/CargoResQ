@@ -16,6 +16,7 @@ from ..events.producer import event_producer
 from shared.events import EventEnvelope
 from shared.idempotency import process_once
 from shared.observability import INCIDENTS_TOTAL, logger
+from services.orchestrator.app.orchestrator import create_incident
 import uuid
 
 limiter = Limiter(key_func=get_remote_address)
@@ -30,15 +31,17 @@ class BreakdownIn(BaseModel):
     client_request_id: Optional[str] = None  # Idempotency key
 
 
-@router.post("")
-@limiter.limit("5/minute")
-async def report_breakdown(
-    request: Request,
+async def ingest_breakdown(
     payload: BreakdownIn,
-    company_id: str = Depends(get_current_company),
-    db: AsyncSession = Depends(get_db),
-):
-    # Verify shipment ownership
+    company_id: str,
+    db: AsyncSession,
+    actor_id: str = "company_operator",
+) -> dict:
+    """Persist a breakdown, create its canonical incident, and emit events.
+
+    This is shared by the desktop/ops endpoint and the dedicated driver app so
+    both clients exercise exactly the same rescue workflow.
+    """
     shipment = await db.get(Shipment, payload.shipment_id)
     if not shipment or shipment.owner_company_id != company_id:
         raise HTTPException(
@@ -57,12 +60,27 @@ async def report_breakdown(
         )
         INCIDENTS_TOTAL.labels(cargo_class=cargo_class).inc()
 
+        incident = await create_incident(
+            session=db,
+            shipment_id=payload.shipment_id,
+            lat=payload.lat,
+            lng=payload.lng,
+            minutes_until_spoilage=(
+                payload.hours_to_spoilage * 60
+                if payload.hours_to_spoilage is not None
+                else None
+            ),
+            actor_id=actor_id,
+            event_publisher=event_producer.publish,
+        )
+
         envelope = EventEnvelope(
             eventType="breakdown.detected",
             producer="core-api",
             eventId=event_id,
             payload={
                 "eventId": event_id,
+                "incidentId": incident.id,
                 "shipmentId": payload.shipment_id,
                 "companyId": company_id,
                 "lat": payload.lat,
@@ -81,10 +99,11 @@ async def report_breakdown(
         logger.info(
             "breakdown_event_published",
             event_id=event_id,
+            incident_id=incident.id,
             shipment_id=payload.shipment_id,
         )
+        return incident
 
-    # Idempotent execution (Phase 18.1)
     was_processed = await process_once(
         session=db,
         event_id=event_id,
@@ -98,3 +117,14 @@ async def report_breakdown(
         "status": "breakdown_registered" if was_processed else "duplicate_request_ignored",
         "wasProcessed": was_processed,
     }
+
+
+@router.post("")
+@limiter.limit("5/minute")
+async def report_breakdown(
+    request: Request,
+    payload: BreakdownIn,
+    company_id: str = Depends(get_current_company),
+    db: AsyncSession = Depends(get_db),
+):
+    return await ingest_breakdown(payload, company_id, db)

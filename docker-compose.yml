@@ -10,12 +10,21 @@ services:
     environment:
       - PORT=8000
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/cargoresq
+      - ENVIRONMENT=development
+      - JWT_SECRET=dev-compose-change-this-secret-before-production
+      - ALLOWED_ORIGINS=*
       - REDIS_URL=redis://redis:6379
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     depends_on:
       - postgres
       - redis
       - kafka
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
 
   postgres:
     image: postgis/postgis:16-3.4

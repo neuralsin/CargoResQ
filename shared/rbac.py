@@ -3,6 +3,7 @@ Role-Based Access Control (RBAC) (Phase 19).
 Enforces authorization for sensitive operations (escrow release, pricing overrides).
 """
 import enum
+import os
 from typing import Optional
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, HTTPBearer, HTTPAuthorizationCredentials
@@ -22,7 +23,7 @@ class Role(str, enum.Enum):
     AUDITOR = "AUDITOR"
 
 
-JWT_SECRET = "cargoresq_super_secret_jwt_key_prod_2026"
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-only-change-this-cargoresq-secret")
 JWT_ALGORITHM = "HS256"
 
 

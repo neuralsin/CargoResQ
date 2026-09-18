@@ -27,6 +27,8 @@ from services.core_api.app.api.companies import router as companies_router
 from services.core_api.app.api.trucks import router as trucks_router
 from services.core_api.app.api.shipments import router as shipments_router
 from services.core_api.app.api.simulation import router as simulation_router
+from services.core_api.app.api.driver import router as driver_router
+from services.core_api.app.config import allowed_origin_list
 from services.matching_engine.app.router import router as matching_router
 from services.pricing_engine.app.router import router as pricing_router
 from services.escrow_ledger.app.router import router as escrow_router
@@ -77,8 +79,8 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # CORS: allow seamless frontend and mobile app access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origin_list(),
+    allow_credentials=allowed_origin_list() != ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -94,6 +96,7 @@ app.include_router(pricing_router)
 app.include_router(escrow_router)
 app.include_router(orchestrator_router)
 app.include_router(simulation_router)
+app.include_router(driver_router)
 
 
 from pathlib import Path
@@ -159,4 +162,3 @@ async def metrics():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
-

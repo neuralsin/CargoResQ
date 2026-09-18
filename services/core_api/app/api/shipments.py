@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from ..database import get_db
-from ..models import Shipment
+from ..models import Shipment, Truck
 from ..auth import get_current_company
 
 router = APIRouter(prefix="/api/v1/shipments", tags=["shipments"])
@@ -71,6 +71,10 @@ async def create_shipment(
     company_id: str = Depends(get_current_company),
     db: AsyncSession = Depends(get_db),
 ):
+    if req.truck_id:
+        truck = await db.get(Truck, req.truck_id)
+        if not truck or truck.company_id != company_id:
+            raise HTTPException(status_code=400, detail="Truck is not owned by your company")
     shipment = Shipment(
         owner_company_id=company_id,
         truck_id=req.truck_id,

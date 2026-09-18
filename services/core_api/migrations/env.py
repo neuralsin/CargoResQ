@@ -7,10 +7,13 @@ from alembic import context
 import os
 import sys
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+sys.path.insert(0, repo_root)
 
-from app.models import Base
-from app.config import settings
+# Import the shared metadata so production migrations cover the unified API,
+# incident orchestrator, and escrow ledger tables as well as core entities.
+from shared.database import Base
+from services.core_api.app.config import settings
 
 config = context.config
 
