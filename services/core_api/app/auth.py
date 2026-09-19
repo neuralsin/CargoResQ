@@ -48,9 +48,57 @@ def create_access_token(
         "role": role,
         "principal_type": principal_type,
         "principal_id": principal_id or subject,
+        "typ": TOKEN_TYPE_ACCESS,
         "exp": expire,
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+#: Marks which kind of token a payload is.
+#:
+#: Without this a refresh token is just an access token with a longer life,
+#: so anything that leaks one gets a month of API access instead of a single
+#: renewal. Every verifier below rejects anything that is not an access
+#: token, and the refresh endpoint accepts only refresh tokens.
+TOKEN_TYPE_ACCESS = "access"
+TOKEN_TYPE_REFRESH = "refresh"
+
+
+def create_refresh_token(
+    subject: str,
+    company_id: str,
+    role: str = "CARRIER_OWNER",
+    principal_type: str = "company",
+    principal_id: Optional[str] = None,
+) -> str:
+    """A long-lived token whose only power is to mint access tokens.
+
+    Drivers work shifts longer than an access token lives, and being logged
+    out on the hard shoulder because two hours elapsed is not an acceptable
+    failure mode. It carries no company scope of its own -- the refresh
+    endpoint re-reads the account before issuing anything.
+    """
+    expire = datetime.now(timezone.utc) + timedelta(
+        days=settings.refresh_token_expire_days
+    )
+    payload = {
+        "sub": subject,
+        "company_id": company_id,
+        "role": role,
+        "principal_type": principal_type,
+        "principal_id": principal_id or subject,
+        "typ": TOKEN_TYPE_REFRESH,
+        "exp": expire,
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+def decode_refresh_token(token: str) -> Dict[str, Any]:
+    """Decode a refresh token, refusing anything that is not one."""
+    payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+    if payload.get("typ") != TOKEN_TYPE_REFRESH:
+        raise JWTError("Not a refresh token")
+    return payload
 
 
 async def get_current_company(token: str = Depends(oauth2_scheme)) -> str:
@@ -67,6 +115,9 @@ async def get_current_company(token: str = Depends(oauth2_scheme)) -> str:
         payload = jwt.decode(
             token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
         )
+        if payload.get("typ") == TOKEN_TYPE_REFRESH:
+            # A refresh token is not a credential for anything but renewal.
+            raise credentials_exception
         company_id = payload.get("company_id")
         if not company_id or not isinstance(company_id, str):
             raise credentials_exception
@@ -84,6 +135,8 @@ async def get_current_principal(token: str = Depends(oauth2_scheme)) -> Dict[str
     )
     try:
         payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+        if payload.get("typ") == TOKEN_TYPE_REFRESH:
+            raise credentials_exception
         if not payload.get("company_id") or not payload.get("sub"):
             raise credentials_exception
         return payload
@@ -124,4 +177,9 @@ def decode_token(token: str) -> Dict[str, Any]:
     Used by the WebSocket handshake, which cannot use Depends().
     Raises JWTError on any failure.
     """
-    return jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+    payload = jwt.decode(
+        token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
+    )
+    if payload.get("typ") == TOKEN_TYPE_REFRESH:
+        raise JWTError("Refresh tokens cannot open a socket")
+    return payload

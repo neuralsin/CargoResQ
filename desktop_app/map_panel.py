@@ -36,6 +36,11 @@ MARKER_COLORS = {
     "rescuer": ("#0D9488", "#FFFFFF"),
     "sos": (COLORS["red"], "#FFFFFF"),
     "destination": (COLORS["ink"], "#FFFFFF"),
+    # Safe storage. Deliberately not red or teal: a depot is neither an
+    # emergency nor a truck, and on a crowded map the distinction has to be
+    # readable at a glance.
+    "storage": ("#4338CA", "#FFFFFF"),
+    "storage_chosen": ("#1E3A8A", "#FFFFFF"),
     # A position the server flagged as spoofed or impossible. Drawn, but
     # visibly different from one that is trusted.
     "suspect": (COLORS["amber"], "#FFFFFF"),
@@ -66,6 +71,16 @@ class MapPanel(ctk.CTkFrame):
         self._paths: List[Any] = []
         self._last_positions: Optional[Tuple[Tuple[float, float], ...]] = None
 
+        # Whether the viewport still belongs to the code or to the person.
+        #
+        # The map used to re-frame itself every time any marker moved. With a
+        # phone sending live GPS that is every few seconds, so zooming in was
+        # pointless: the view snapped back before you could read it. Now the
+        # first draw frames everything and after that the viewport is the
+        # user's until they ask for it back.
+        self._has_fitted = False
+        self._user_controls_view = False
+
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
@@ -81,13 +96,29 @@ class MapPanel(ctk.CTkFrame):
         )
         self.title.grid(row=0, column=0, sticky="w")
 
+        self.fit_button = ctk.CTkButton(
+            header,
+            text="Fit all",
+            width=62,
+            height=24,
+            corner_radius=6,
+            fg_color=COLORS["row"],
+            hover_color=COLORS["line"],
+            text_color=COLORS["ink"],
+            border_width=1,
+            border_color=COLORS["line"],
+            font=ctk.CTkFont(size=10),
+            command=self.refit,
+        )
+        self.fit_button.grid(row=0, column=1, sticky="e", padx=(0, 8))
+
         self.subtitle = ctk.CTkLabel(
             header,
             text="OpenStreetMap",
             text_color=COLORS["muted"],
             font=ctk.CTkFont(size=11),
         )
-        self.subtitle.grid(row=0, column=1, sticky="e")
+        self.subtitle.grid(row=0, column=2, sticky="e")
 
         TILE_CACHE.parent.mkdir(parents=True, exist_ok=True)
         self.map_view = TkinterMapView(
@@ -105,6 +136,16 @@ class MapPanel(ctk.CTkFrame):
         self.map_view.set_position(*initial_position)
         self.map_view.set_zoom(initial_zoom)
         self.map_view.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+
+        # Any direct interaction means the person is looking at something
+        # specific. Dragging the view out from under them at that point is
+        # the single most irritating thing a live map can do.
+        canvas = getattr(self.map_view, "canvas", self.map_view)
+        for sequence in ("<Button-1>", "<B1-Motion>", "<MouseWheel>", "<Button-4>", "<Button-5>"):
+            try:
+                canvas.bind(sequence, self._note_user_interaction, add="+")
+            except Exception:
+                pass
 
         self.footer = ctk.CTkLabel(
             self,
@@ -257,6 +298,27 @@ class MapPanel(ctk.CTkFrame):
             )
         except Exception:
             self.focus_on(sum(lats) / len(lats), sum(lngs) / len(lngs), zoom=9)
+
+    def _note_user_interaction(self, _event: Any = None) -> None:
+        self._user_controls_view = True
+        self.fit_button.configure(text="Fit all ↺")
+
+    def refit(self) -> None:
+        """Hand the viewport back to the map and re-frame everything."""
+        self._user_controls_view = False
+        self.fit_button.configure(text="Fit all")
+        if self._last_positions:
+            self.fit_to_markers(list(self._last_positions))
+
+    def maybe_fit(self, positions: List[Tuple[float, float]]) -> None:
+        """Frame the markers, but only while the viewport is still ours."""
+        self._last_positions = tuple(positions)
+        if self._user_controls_view or not positions:
+            return
+        if self._has_fitted:
+            return
+        self.fit_to_markers(positions)
+        self._has_fitted = True
 
     def set_status(self, text: str) -> None:
         self.footer.configure(text=text)

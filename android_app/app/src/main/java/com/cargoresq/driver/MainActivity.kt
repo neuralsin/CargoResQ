@@ -82,6 +82,11 @@ class MainActivity : AppCompatActivity() {
     /** Centre on the driver once, then leave the map where they put it. */
     private var hasCentredOnce = false
     private var driverMarker: Marker? = null
+
+    /** The other truck in a live rescue, and its pin on the map. */
+    private var counterpart: CounterpartLink? = null
+    private var counterpartMarker: Marker? = null
+    private var counterpartJob: Job? = null
     private var tickerJob: Job? = null
 
     private val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
@@ -94,6 +99,30 @@ class MainActivity : AppCompatActivity() {
         private const val TAB_SOS = 2
         private const val TAB_SAFETY = 3
         private const val TAB_ACCOUNT = 4
+
+        /** How often two converging trucks re-read each other. */
+        private const val COUNTERPART_POLL_MS = 5_000L
+
+        /** And how often to check whether a rescue has started. */
+        private const val COUNTERPART_IDLE_MS = 20_000L
+
+        /**
+         * States a breakdown can still be taken back from.
+         *
+         * Mirrors STANDABLE_DOWN on the server. The cut is where the cargo
+         * stops being on its own truck: up to DRIVER_EN_ROUTE the rescuer is
+         * merely on the way, so there is nothing in the physical world to
+         * undo. The server enforces this regardless; the app hides the button
+         * so a driver is not offered something that will be refused.
+         */
+        private val STAND_DOWN_STATES = setOf(
+            "BREAKDOWN_REPORTED",
+            "TRIAGING",
+            "MATCHING",
+            "RESCUE_OFFERED",
+            "RESCUE_ACCEPTED",
+            "DRIVER_EN_ROUTE",
+        )
     }
 
     private val locationPermissionLauncher = registerForActivityResult(
@@ -161,6 +190,7 @@ class MainActivity : AppCompatActivity() {
         // background, so what is on screen is stale by definition.
         if (Session.isSignedIn) {
             loadEverything()
+            startCounterpartPolling()
         }
     }
 
@@ -169,6 +199,7 @@ class MainActivity : AppCompatActivity() {
         // duty service keeps its own subscription; this one is only for the
         // map the driver is looking at.
         stopLocationTicker()
+        stopCounterpartPolling()
         homeMap?.onPause()
         super.onPause()
     }
@@ -320,6 +351,7 @@ class MainActivity : AppCompatActivity() {
         navBar.visibility = View.VISIBLE
         switchTab(TAB_HOME)
         loadEverything()
+        startCounterpartPolling()
     }
 
     private fun signOut() {
@@ -329,6 +361,9 @@ class MainActivity : AppCompatActivity() {
         shipment = null
         incident = null
         offers = emptyList()
+        stopCounterpartPolling()
+        counterpart = null
+        counterpartMarker = null
         showAuth()
     }
 
@@ -343,6 +378,7 @@ class MainActivity : AppCompatActivity() {
             CargoResQApi.activeShipment(token).onSuccess { shipment = it }
             CargoResQApi.activeIncident(token).onSuccess { incident = it }
             CargoResQApi.offerInbox(token).onSuccess { offers = it }
+            CargoResQApi.counterpart(token).onSuccess { counterpart = it }
             if (emergencyNumbers.isEmpty()) {
                 CargoResQApi.emergencyNumbers().onSuccess { emergencyNumbers = it }
             }
@@ -413,8 +449,21 @@ class MainActivity : AppCompatActivity() {
         view.findViewById<Button>(R.id.btn_recentre).setOnClickListener { recentreMap() }
 
         // -- active incident --
-        incident?.let { inc ->
-            view.findViewById<LinearLayout>(R.id.card_incident).visibility = View.VISIBLE
+        //
+        // The card is driven by whether an incident exists, not only by the
+        // arrival of one. Previously it was made visible inside the non-null
+        // branch and never hidden again, so a driver who cancelled their
+        // breakdown kept looking at a red card offering to cancel it a
+        // second time.
+        val incidentCard = view.findViewById<LinearLayout>(R.id.card_incident)
+        val standDown = view.findViewById<Button>(R.id.btn_stand_down)
+        val inc = incident
+        if (inc == null) {
+            incidentCard.visibility = View.GONE
+            standDown.visibility = View.GONE
+            standDown.setOnClickListener(null)
+        } else {
+            incidentCard.visibility = View.VISIBLE
             view.findViewById<TextView>(R.id.text_incident_state).text =
                 inc.state.replace('_', ' ').lowercase().replaceFirstChar { it.uppercase() }
             val spoilage = inc.minutesUntilSpoilage
@@ -426,7 +475,18 @@ class MainActivity : AppCompatActivity() {
                     append(" min before the cargo is at risk")
                 }
             }
+
+            if (inc.state in STAND_DOWN_STATES) {
+                standDown.visibility = View.VISIBLE
+                standDown.setOnClickListener { confirmStandDown() }
+            } else {
+                standDown.visibility = View.GONE
+                standDown.setOnClickListener(null)
+            }
         }
+
+        renderTelemetry(view)
+        renderCounterpart(view)
 
         // -- assigned load --
         val cargoTitle = view.findViewById<TextView>(R.id.text_cargo_type)
@@ -469,8 +529,28 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        view.findViewById<Button>(R.id.btn_report_breakdown).setOnClickListener {
-            confirmBreakdown()
+        // The breakdown button needs a load to report a breakdown of. Offering
+        // it with nothing assigned produced a bare "no active shipment" error
+        // on tap, which reads like a fault in the app rather than the plain
+        // fact that this truck is running empty.
+        val breakdownButton = view.findViewById<Button>(R.id.btn_report_breakdown)
+        val hasLoad = shipment != null
+        breakdownButton.isEnabled = hasLoad
+        breakdownButton.alpha = if (hasLoad) 1f else 0.45f
+        breakdownButton.text = if (hasLoad) {
+            "Report breakdown"
+        } else {
+            "No load assigned"
+        }
+        breakdownButton.setOnClickListener {
+            if (shipment == null) {
+                toast(
+                    "There is no load on this truck to report a breakdown for. " +
+                        "Ask your dispatcher to assign a shipment."
+                )
+            } else {
+                confirmBreakdown()
+            }
         }
 
         val swipe = view.findViewById<SwipeRefreshLayout>(R.id.swipe_home)
@@ -591,6 +671,12 @@ class MainActivity : AppCompatActivity() {
             status.text = when {
                 onDuty -> "Sharing your position"
                 else -> "Your position"
+            }
+
+            // The telemetry strip is a readout of this fix, so it moves with
+            // it rather than waiting for the next full screen reload.
+            if (currentTab == TAB_HOME && contentFrame.childCount > 0) {
+                renderTelemetry(contentFrame.getChildAt(0))
             }
         }
 
@@ -1377,6 +1463,267 @@ class MainActivity : AppCompatActivity() {
     private fun formatWeight(kg: Double): String =
         if (kg >= 1000) String.format(Locale.US, "%.1f t", kg / 1000)
         else String.format(Locale.US, "%.0f kg", kg)
+
+    /**
+     * Take back a breakdown report.
+     *
+     * Confirmed first, and the confirmation says what it will undo. A driver
+     * who has been waiting forty minutes for a rescue should know that
+     * pressing this is what sends that rescuer home.
+     */
+    private fun confirmStandDown() {
+        AlertDialog.Builder(this)
+            .setTitle("Back on the road?")
+            .setMessage(
+                "This cancels your breakdown. Any carrier coming to help will " +
+                    "be stood down and the load goes back to in transit. " +
+                    "Only do this if you can complete the trip."
+            )
+            .setNegativeButton("Stay stopped", null)
+            .setPositiveButton("Cancel breakdown") { _, _ -> standDown() }
+            .show()
+    }
+
+    private fun standDown() {
+        val token = Session.token ?: return
+        lifecycleScope.launch {
+            CargoResQApi.standDown(token, "Driver reported back on the road")
+                .onSuccess { result ->
+                    incident = null
+                    toast(
+                        if (result.offersWithdrawn > 0) {
+                            "Breakdown cancelled. " + result.offersWithdrawn +
+                                " carrier offer(s) stood down."
+                        } else {
+                            "Breakdown cancelled. You are back in transit."
+                        }
+                    )
+                    loadEverything()
+                }
+                .onFailure { toast(it.message ?: "Could not cancel the breakdown") }
+        }
+    }
+
+
+    /**
+     * Show the other truck in this rescue, or nothing at all.
+     *
+     * Distance is the headline because it is the question. Everything else --
+     * who they are, what they are driving, whether the fix is current -- is
+     * context for deciding whether to believe it.
+     */
+    private fun renderCounterpart(view: View) {
+        val card = view.findViewById<LinearLayout>(R.id.card_counterpart) ?: return
+        val link = counterpart
+        if (link == null) {
+            card.visibility = View.GONE
+            removeCounterpartMarker()
+            return
+        }
+        card.visibility = View.VISIBLE
+
+        view.findViewById<TextView>(R.id.text_counterpart_role).text =
+            if (link.iAmStranded) "RESCUER EN ROUTE" else "STRANDED TRUCK"
+
+        val distance = view.findViewById<TextView>(R.id.text_counterpart_distance)
+        distance.text = when {
+            link.arrived -> "Arriving now"
+            link.distanceKm == null -> "Position unknown"
+            link.distanceKm < 1.0 -> String.format("%.0f m away", link.distanceKm * 1000)
+            else -> String.format("%.1f km away", link.distanceKm)
+        }
+
+        view.findViewById<TextView>(R.id.text_counterpart_who).text = buildString {
+            append(link.companyName)
+            link.registrationNumber?.let { append(" - ").append(it) }
+            link.driverName?.let { append(" (").append(it).append(")") }
+        }
+
+        view.findViewById<TextView>(R.id.text_counterpart_detail).text = buildString {
+            if (link.arrived) {
+                append("Look around - they are at your position")
+            } else if (link.etaMinutes != null) {
+                append("About ").append(link.etaMinutes.toInt()).append(" min away")
+            }
+            if (link.speedKph != null && link.speedKph > 1) {
+                append(" - moving at ").append(link.speedKph.toInt()).append(" km/h")
+            }
+            // Never let a stale fix pass for a live one. A driver deciding
+            // whether to step into traffic deserves to know the pin is old.
+            append(if (link.positionIsLive) " - live" else " - position not current")
+            link.minutesUntilSpoilage?.let {
+                append(" - ").append(it.toInt()).append(" min of cargo time left")
+            }
+        }
+
+        val call = view.findViewById<Button>(R.id.btn_call_counterpart)
+        val phone = link.driverPhone
+        if (phone.isNullOrBlank()) {
+            call.visibility = View.GONE
+        } else {
+            call.visibility = View.VISIBLE
+            call.setOnClickListener { dial(phone) }
+        }
+
+        homeMap?.let { placeCounterpartMarker(it, link) }
+    }
+
+    private fun placeCounterpartMarker(map: MapView, link: CounterpartLink) {
+        val lat = link.latitude
+        val lng = link.longitude
+        if (lat == null || lng == null) {
+            removeCounterpartMarker()
+            return
+        }
+        try {
+            val point = GeoPoint(lat, lng)
+            val existing = counterpartMarker
+            if (existing != null && map.overlays.contains(existing)) {
+                existing.position = point
+                existing.title = link.registrationNumber ?: link.companyName
+            } else {
+                val marker = Marker(map).apply {
+                    position = point
+                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                    title = link.registrationNumber ?: link.companyName
+                    snippet = if (link.iAmStranded) "Your rescuer" else "Stranded truck"
+                }
+                map.overlays.add(marker)
+                counterpartMarker = marker
+            }
+            map.invalidate()
+        } catch (e: Exception) {
+            // A failed marker draw must not take the screen down.
+        }
+    }
+
+    private fun removeCounterpartMarker() {
+        val marker = counterpartMarker ?: return
+        try {
+            homeMap?.overlays?.remove(marker)
+            homeMap?.invalidate()
+        } catch (e: Exception) {
+            // Ignore teardown races.
+        }
+        counterpartMarker = null
+    }
+
+
+    /**
+     * Keep the counterpart card current while a rescue is running.
+     *
+     * Two trucks converging is the one thing on this screen that changes
+     * meaningfully second to second, and a distance that only updates when
+     * the driver pulls to refresh is worse than no distance at all -- it
+     * looks live and is not.
+     *
+     * Only polls while a rescue actually exists, and stops the moment the
+     * screen goes away. A phone on a dashboard with no job running should not
+     * be spending battery on an endpoint that returns null.
+     */
+    private fun startCounterpartPolling() {
+        if (counterpartJob?.isActive == true) return
+        counterpartJob = lifecycleScope.launch {
+            while (isActive) {
+                val token = Session.token
+                if (token == null) {
+                    break
+                }
+                CargoResQApi.counterpart(token).onSuccess { link ->
+                    val had = counterpart != null
+                    counterpart = link
+                    if (currentTab == TAB_HOME) {
+                        val root = if (contentFrame.childCount > 0) {
+                            contentFrame.getChildAt(0)
+                        } else {
+                            null
+                        }
+                        root?.let { renderCounterpart(it) }
+                    }
+                    // A rescue that has just bound or just ended changes more
+                    // than this one card, so reload the rest of the screen.
+                    if (had != (link != null)) {
+                        loadEverything()
+                    }
+                }
+                delay(if (counterpart != null) COUNTERPART_POLL_MS else COUNTERPART_IDLE_MS)
+            }
+        }
+    }
+
+    private fun stopCounterpartPolling() {
+        counterpartJob?.cancel()
+        counterpartJob = null
+    }
+
+
+    /**
+     * What the phone is currently reporting, in the driver's own words.
+     *
+     * Every figure here comes from the device or from a value the server
+     * accepted. Nothing is smoothed, filled in or held over from the last
+     * reading -- a dash means the phone genuinely does not know, which is
+     * information in itself when a dispatcher says the truck has vanished.
+     */
+    private fun renderTelemetry(view: View) {
+        val state = view.findViewById<TextView>(R.id.text_telemetry_state) ?: return
+        val speed = view.findViewById<TextView>(R.id.text_tele_speed)
+        val accuracy = view.findViewById<TextView>(R.id.text_tele_accuracy)
+        val battery = view.findViewById<TextView>(R.id.text_tele_battery)
+        val detail = view.findViewById<TextView>(R.id.text_tele_detail)
+
+        state.text = if (onDuty) "Reporting to dispatch" else "Not reporting"
+        state.setTextColor(
+            ContextCompat.getColor(this, if (onDuty) R.color.teal else R.color.muted)
+        )
+
+        val fix = lastKnownLocation
+        speed.text = if (fix != null && fix.hasSpeed()) {
+            // Location reports metres per second; nobody drives in those.
+            String.format("%.0f", fix.speed * 3.6) + " km/h"
+        } else {
+            "--"
+        }
+        accuracy.text = if (fix != null && fix.hasAccuracy()) {
+            String.format("%.0f m", fix.accuracy)
+        } else {
+            "--"
+        }
+
+        val level = batteryPercent()
+        battery.text = if (level != null) level.toString() + "%" else "--"
+
+        detail.text = buildString {
+            if (fix == null) {
+                append("Waiting for a GPS fix")
+            } else {
+                append(String.format("%.5f, %.5f", fix.latitude, fix.longitude))
+                val age = (System.currentTimeMillis() - fix.time) / 1000
+                if (age in 0..86_400) {
+                    append(" - fix ")
+                    append(if (age < 60) age.toString() + "s" else (age / 60).toString() + "m")
+                    append(" old")
+                }
+                if (fix.hasBearing()) {
+                    append(" - heading ").append(fix.bearing.toInt()).append("\u00b0")
+                }
+            }
+            if (!onDuty) {
+                append(" - go on duty to send this to your dispatcher")
+            }
+        }
+    }
+
+    /** Battery level as a whole percent, or null if the OS will not say. */
+    private fun batteryPercent(): Int? = try {
+        val manager = getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
+        val level = manager?.getIntProperty(
+            android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY
+        )
+        if (level == null || level < 0) null else level
+    } catch (e: Exception) {
+        null
+    }
 
     private fun toast(message: String) {
         Toast.makeText(this, message, Toast.LENGTH_LONG).show()

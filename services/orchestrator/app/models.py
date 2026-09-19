@@ -5,7 +5,7 @@ Canonical source of truth for rescue incident lifecycles and append-only audit t
 from datetime import datetime
 import enum
 import uuid
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import String, Float, DateTime, ForeignKey, Enum as SAEnum, JSON, func, text
 
@@ -91,6 +91,23 @@ class Incident(Base):
     lat: Mapped[float] = mapped_column(Float, nullable=False)
     lng: Mapped[float] = mapped_column(Float, nullable=False)
     minutes_until_spoilage: Mapped[float] = mapped_column(Float, nullable=True)
+
+    # Where the cargo is now going, when it is no longer going where it was.
+    #
+    # A relay is a change of destination, not a different kind of incident:
+    # a truck still collects the load and still delivers it, so the rescue
+    # lifecycle and its escrow are unchanged. Only the endpoint moves, from
+    # the customer's door to a chiller that can hold the cargo until the
+    # journey can be resumed. Null means the load is still going where it was
+    # always going.
+    relay_facility_id: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    relay_reason: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    relay_committed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

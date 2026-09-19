@@ -196,3 +196,75 @@ class Shipment(Base):
 
     company: Mapped["Company"] = relationship(back_populates="shipments")
     truck: Mapped[Optional["Truck"]] = relationship(back_populates="shipments")
+
+
+class StorageFacility(Base):
+    """A place cargo can be put when it cannot continue its journey.
+
+    Not every breakdown has a rescue. Sometimes no compatible truck is within
+    reach of a load that has ninety minutes of cold left, and the choice is
+    between spoiling it on the hard shoulder and getting it into a chiller
+    forty minutes away. The second option is worth far more than a perfect
+    rescue that arrives too late, so the network has to know where those
+    chillers are.
+
+    Facilities are shared infrastructure rather than any one carrier's
+    property: a bonded warehouse will take a competitor's pallets for a
+    handling fee, which is the whole reason a relay works. `operator_company_id`
+    records who runs it when that is a member company, and is null for the
+    third-party depots that make up most of the network.
+    """
+
+    __tablename__ = "storage_facilities"
+    __table_args__ = (
+        CheckConstraint("capacity_m3 > 0", name="chk_facility_capacity_positive"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=lambda: f"stor_{uuid.uuid4().hex[:8]}"
+    )
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    #: Null for a third-party depot that belongs to no member company.
+    operator_company_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("companies.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    latitude: Mapped[float] = mapped_column(Float, nullable=False)
+    longitude: Mapped[float] = mapped_column(Float, nullable=False)
+    address: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    contact_phone: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+
+    #: What the site can actually hold. A facility that cannot take the cargo
+    #: is not a fallback, so these are matched against the shipment the same
+    #: way a truck's capacity is.
+    refrigerated: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0"), nullable=False
+    )
+    min_temp_c: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    max_temp_c: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    hazmat_approved: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0"), nullable=False
+    )
+    capacity_m3: Mapped[float] = mapped_column(Float, nullable=False)
+    available_m3: Mapped[float] = mapped_column(Float, nullable=False)
+
+    #: What it costs to put a load in, per cubic metre per day. Shown to the
+    #: owner next to the spoilage they are avoiding, because the decision is
+    #: always that comparison and never the fee on its own.
+    handling_fee_inr: Mapped[float] = mapped_column(
+        Float, default=0.0, server_default=text("0"), nullable=False
+    )
+    storage_fee_inr_per_m3_day: Mapped[float] = mapped_column(
+        Float, default=0.0, server_default=text("0"), nullable=False
+    )
+
+    #: A depot with a closed gate at 2am is not an option at 2am.
+    open_24h: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("1"), nullable=False
+    )
+    active: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("1"), nullable=False
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

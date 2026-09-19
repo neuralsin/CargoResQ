@@ -25,6 +25,7 @@ object Session {
 
     private const val FILE = "cargoresq.session"
     private const val KEY_TOKEN = "token"
+    private const val KEY_REFRESH = "refresh_token"
     private const val KEY_DRIVER_ID = "driver_id"
     private const val KEY_DRIVER_NAME = "driver_name"
     private const val KEY_COMPANY_ID = "company_id"
@@ -64,6 +65,7 @@ object Session {
         if (!token.isNullOrBlank()) {
             current = DriverSession(
                 token = token,
+                refreshToken = store.getString(KEY_REFRESH, "").orEmpty(),
                 driverId = store.getString(KEY_DRIVER_ID, "").orEmpty(),
                 driverName = store.getString(KEY_DRIVER_NAME, "").orEmpty(),
                 companyId = store.getString(KEY_COMPANY_ID, "").orEmpty(),
@@ -91,6 +93,7 @@ object Session {
         current = session
         prefs?.edit()?.apply {
             putString(KEY_TOKEN, session.token)
+            putString(KEY_REFRESH, session.refreshToken)
             putString(KEY_DRIVER_ID, session.driverId)
             putString(KEY_DRIVER_NAME, session.driverName)
             putString(KEY_COMPANY_ID, session.companyId)
@@ -102,6 +105,7 @@ object Session {
         current = null
         prefs?.edit()?.apply {
             remove(KEY_TOKEN)
+            remove(KEY_REFRESH)
             remove(KEY_DRIVER_ID)
             remove(KEY_DRIVER_NAME)
             remove(KEY_COMPANY_ID)
@@ -137,5 +141,18 @@ object Session {
         }
 
     val token: String? get() = current?.token
+    val refreshToken: String? get() = current?.refreshToken
+
+    /**
+     * Swap in a newly minted pair, keeping the driver's identity.
+     *
+     * Called from the API layer after a silent refresh, so the rest of the
+     * app never sees the token change underneath it.
+     */
+    @Synchronized
+    fun updateTokens(accessToken: String, refreshToken: String) {
+        val existing = current ?: return
+        save(existing.copy(token = accessToken, refreshToken = refreshToken))
+    }
     val isSignedIn: Boolean get() = current != null
 }

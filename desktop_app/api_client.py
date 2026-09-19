@@ -187,6 +187,38 @@ class CargoResQClient:
             json={"new_state": new_state, "metadata": metadata},
         )
 
+    def active_rescues(self) -> List[Dict[str, Any]]:
+        """Rescues we are performing for another carrier, with live tracking."""
+        return self.get("/api/v1/rescues/active")
+
+    def stand_down_incident(self, incident_id: str, reason: str = "") -> Dict[str, Any]:
+        """Take back a breakdown, unwinding offers, escrow and truck holds."""
+        return self.post(
+            f"/api/v1/incidents/{incident_id}/stand-down",
+            json={"reason": reason or None},
+        )
+
+    # -- relay and split --------------------------------------------------
+    def storage_facilities(
+        self, lat: Optional[float] = None, lng: Optional[float] = None
+    ) -> List[Dict[str, Any]]:
+        query = f"?lat={lat}&lng={lng}" if lat is not None and lng is not None else ""
+        return self.get(f"/api/v1/storage/facilities{query}")
+
+    def relay_options(self, incident_id: str) -> Dict[str, Any]:
+        return self.get(f"/api/v1/incidents/{incident_id}/relay-options")
+
+    def relay_to_storage(
+        self, incident_id: str, facility_id: str, reason: str = ""
+    ) -> Dict[str, Any]:
+        return self.post(
+            f"/api/v1/incidents/{incident_id}/relay",
+            json={"facility_id": facility_id, "reason": reason or None},
+        )
+
+    def split_plan(self, incident_id: str) -> Dict[str, Any]:
+        return self.get(f"/api/v1/incidents/{incident_id}/split-plan")
+
     def reputation(self, company_id: str) -> Dict[str, Any]:
         return self.get(f"/api/v1/companies/{company_id}/reputation")
 

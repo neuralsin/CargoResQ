@@ -166,6 +166,201 @@
                     android:layout_marginTop="4dp"
                     android:textColor="@color/ink"
                     android:textSize="12sp" />
+
+                <!-- The way out of a breakdown that turned out not to be one.
+                     Hidden once the cargo has been handed over, because past
+                     that point there is a real rescue in progress that has to
+                     be resolved rather than erased. -->
+                <Button
+                    android:id="@+id/btn_stand_down"
+                    android:layout_width="match_parent"
+                    android:layout_height="46dp"
+                    android:layout_marginTop="12dp"
+                    android:text="Back on the road - cancel"
+                    android:textSize="13sp"
+                    android:background="@drawable/bg_pill_outline"
+                    android:textColor="@color/ink"
+                    android:visibility="gone" />
+            </LinearLayout>
+
+
+
+            <!-- What this phone is reporting right now.
+                 A driver whose employer is tracking them should be able to
+                 see exactly what is being sent, and whether it is getting
+                 through. It also answers the first question anyone asks when
+                 a dispatcher says they cannot see the truck. -->
+            <LinearLayout
+                android:id="@+id/card_telemetry"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:background="@drawable/bg_card"
+                android:padding="16dp"
+                android:layout_marginTop="16dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal">
+
+                    <TextView style="@style/CargoText.Eyebrow"
+                        android:layout_width="0dp"
+                        android:layout_weight="1"
+                        android:layout_height="wrap_content"
+                        android:text="LIVE TELEMETRY" />
+
+                    <TextView
+                        android:id="@+id/text_telemetry_state"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:textColor="@color/muted"
+                        android:textSize="11sp"
+                        android:text="Off duty" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:layout_marginTop="10dp">
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_weight="1"
+                        android:layout_height="wrap_content"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:id="@+id/text_tele_speed"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:textColor="@color/ink"
+                            android:textSize="20sp"
+                            android:textStyle="bold"
+                            android:text="--" />
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:textColor="@color/muted"
+                            android:textSize="10sp"
+                            android:text="SPEED" />
+                    </LinearLayout>
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_weight="1"
+                        android:layout_height="wrap_content"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:id="@+id/text_tele_accuracy"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:textColor="@color/ink"
+                            android:textSize="20sp"
+                            android:textStyle="bold"
+                            android:text="--" />
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:textColor="@color/muted"
+                            android:textSize="10sp"
+                            android:text="GPS ACCURACY" />
+                    </LinearLayout>
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_weight="1"
+                        android:layout_height="wrap_content"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:id="@+id/text_tele_battery"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:textColor="@color/ink"
+                            android:textSize="20sp"
+                            android:textStyle="bold"
+                            android:text="--" />
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:textColor="@color/muted"
+                            android:textSize="10sp"
+                            android:text="BATTERY" />
+                    </LinearLayout>
+                </LinearLayout>
+
+                <TextView
+                    android:id="@+id/text_tele_detail"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:textColor="@color/muted"
+                    android:textSize="11sp" />
+            </LinearLayout>
+
+            <!-- The other truck in a live rescue.
+                 Sits directly under the incident card because when a rescue
+                 is running this is the only thing either driver wants to
+                 know: who is coming, and how far off they are. -->
+            <LinearLayout
+                android:id="@+id/card_counterpart"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:background="@drawable/bg_card"
+                android:padding="16dp"
+                android:layout_marginTop="16dp"
+                android:visibility="gone">
+
+                <TextView
+                    android:id="@+id/text_counterpart_role"
+                    style="@style/CargoText.Eyebrow"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="RESCUER EN ROUTE" />
+
+                <TextView
+                    android:id="@+id/text_counterpart_distance"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:textColor="@color/ink"
+                    android:textSize="26sp"
+                    android:textStyle="bold"
+                    android:text="--" />
+
+                <TextView
+                    android:id="@+id/text_counterpart_who"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:textColor="@color/ink"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/text_counterpart_detail"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:textColor="@color/muted"
+                    android:textSize="11sp" />
+
+                <Button
+                    android:id="@+id/btn_call_counterpart"
+                    android:layout_width="match_parent"
+                    android:layout_height="46dp"
+                    android:layout_marginTop="12dp"
+                    android:text="Call the other driver"
+                    android:textSize="13sp"
+                    android:background="@drawable/bg_pill_outline"
+                    android:textColor="@color/ink"
+                    android:visibility="gone" />
             </LinearLayout>
 
             <TextView style="@style/CargoText.Eyebrow"

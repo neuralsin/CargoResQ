@@ -28,11 +28,19 @@ sys.path.insert(0, str(ROOT))
 from sqlalchemy import delete, select
 
 from services.core_api.app.auth import hash_password
-from services.core_api.app.models import Company, Driver, Shipment, Truck, TruckStatus
+from services.core_api.app.models import (
+    Company,
+    Driver,
+    Shipment,
+    StorageFacility,
+    Truck,
+    TruckStatus,
+)
 from services.escrow_ledger.app.models import Escrow, LedgerEntry
 from services.orchestrator.app.models import Incident, IncidentEvent, IncidentState
 from services.orchestrator.app.offer_models import OfferState, RescueOffer
 from services.orchestrator.app.reputation_models import CompanyReputation, RescueRating
+from services.pricing_engine.app.pricing import calculate_price
 from services.sos.app.models import (
     SosAlert,
     SosBroadcast,
@@ -135,6 +143,7 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
     async with async_session() as session:
         if reset:
             # Delete dependent entities in clean dependency order
+            await session.execute(delete(StorageFacility))
             await session.execute(delete(RescueRating))
             await session.execute(delete(CompanyReputation))
             await session.execute(delete(SosResponse))
@@ -278,7 +287,8 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
             registration_number="MH-14-DR-0880",
             latitude=18.5600,
             longitude=73.8100,
-            status=TruckStatus.idle,
+            # Carrying Deepak's load, so it is not a rescue candidate.
+            status=TruckStatus.in_transit,
             refrigerated=False,
             max_volume_m3=18.0,
             max_weight_kg=5000.0,
@@ -306,7 +316,14 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
             latitude=19.0910,
             longitude=73.0080,
             status=TruckStatus.idle,
-            refrigerated=False,
+            # Refrigerated, because it is seeded with a live offer on a
+            # refrigerated load. An ambient truck bidding for insulin is an
+            # offer the matcher's own compatibility check would have refused,
+            # and showing one on the console contradicts the rule the demo is
+            # there to demonstrate. It chills less deeply than Northline's,
+            # which is the honest reason it scores lower.
+            refrigerated=True,
+            min_temp_c=-12.0,
             max_volume_m3=14.0,
             max_weight_kg=3500.0,
         )
@@ -375,7 +392,9 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
             email="deepak@northline.example",
             hashed_password=hash_password(driver_pw),
             phone="+919833445566",
-            assigned_truck_id=trk_north_9110.id,
+            # Moved off the reefer so MH-14-EQ-9110 stays idle and available
+            # to the split planner, and so Deepak has a load of his own.
+            assigned_truck_id=trk_north_880.id,
         )
         session.add_all([
             drv_apex_rajesh, drv_apex_vikram, drv_apex_amit,
@@ -403,6 +422,30 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
             destination_lng=72.8777,
             destination_name="Bandra Central Hospital, Mumbai",
             planned_arrival_at=now + timedelta(hours=4),
+        )
+        # A load no single idle reefer nearby can take.
+        #
+        # The nearest compatible trucks are 24, 20 and 15 m3 against 38 m3 of
+        # cargo, so this is the case the splitter exists for: three vehicles
+        # are parked within twenty kilometres of a consignment that would
+        # otherwise be written off as unrescuable.
+        shp_bulk_vaccine = Shipment(
+            id="shp_bulk_vax_7701",
+            owner_company_id=apex.id,
+            truck_id=trk_apex_5510.id,
+            cargo_type="Bulk paediatric vaccine consignment",
+            requires_refrigeration=True,
+            required_max_temp_c=8.0,
+            volume_m3=38.0,
+            weight_kg=9500.0,
+            value_inr=6200000.0,
+            status="in_transit",
+            origin_lat=18.7500,
+            origin_lng=73.4200,
+            destination_lat=18.5204,
+            destination_lng=73.8567,
+            destination_name="Pune Regional Vaccine Store",
+            planned_arrival_at=now + timedelta(hours=5),
         )
         shp_biologics = Shipment(
             id="shp_biologics_3310",
@@ -462,7 +505,34 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
             status="delivered",
             destination_name="Cipla Distribution Depot",
         )
-        session.add_all([shp_insulin, shp_biologics, shp_semicon, shp_plasma, shp_api])
+        # Deepak's load, so the demo has a second driver who can actually
+        # report a breakdown.
+        #
+        # Every driver except Rajesh was running empty, which meant the
+        # breakdown button on a second phone failed with "no active shipment
+        # assigned to this truck". This is an ambient load on an ambient
+        # truck, deliberately at the other end of the corridor and belonging
+        # to the other carrier -- so the rescue runs in the opposite
+        # direction, with Apex's idle trucks as the candidates.
+        shp_northline_parts = Shipment(
+            id="shp_north_parts_5501",
+            owner_company_id=northline.id,
+            truck_id=trk_north_880.id,
+            cargo_type="Automotive assembly components",
+            requires_refrigeration=False,
+            volume_m3=12.0,
+            weight_kg=3800.0,
+            value_inr=1450000.0,
+            status="in_transit",
+            origin_lat=18.5600,
+            origin_lng=73.8100,
+            destination_lat=19.0760,
+            destination_lng=72.8777,
+            destination_name="Bhiwandi Distribution Park",
+            planned_arrival_at=now + timedelta(hours=6),
+        )
+
+        session.add_all([shp_insulin, shp_bulk_vaccine, shp_biologics, shp_semicon, shp_plasma, shp_api, shp_northline_parts])
         await session.flush()
 
         # ------------------------------------------------------------------
@@ -481,6 +551,18 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
             lng=73.8567,
             minutes_until_spoilage=84.0,
         )
+        # The oversized consignment, still looking for capacity. Left at
+        # MATCHING so the console can demonstrate both routes out of it:
+        # fanning offers to carriers, and dividing the load when no single
+        # one of them can take it.
+        inc_bulk = Incident(
+            id="inc_apex_bulk_vax",
+            shipment_id=shp_bulk_vaccine.id,
+            state=IncidentState.MATCHING,
+            lat=18.6600,
+            lng=73.7500,
+            minutes_until_spoilage=140.0,
+        )
         # Historic completed rescue
         inc_past = Incident(
             id="inc_apex_historic_01",
@@ -490,7 +572,7 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
             lng=73.1200,
             assigned_truck_id=trk_north_412.id,
         )
-        session.add_all([inc_active, inc_past])
+        session.add_all([inc_active, inc_bulk, inc_past])
         await session.flush()
 
         # Incident audit events
@@ -555,6 +637,32 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
         # ------------------------------------------------------------------
         # 6. Rescue Offers
         # ------------------------------------------------------------------
+        # Priced by the real pricing engine rather than by hand, so the
+        # breakdown the console shows is arithmetic that actually happened.
+        # Seeding a total with a plausible-looking breakdown beside it is how
+        # a demo ends up displaying numbers that do not add up when somebody
+        # in the audience checks them.
+        quote_north = calculate_price(
+            distance_km=8.4,
+            requires_refrigeration=True,
+            weight_kg=shp_insulin.weight_kg,
+            volume_m3=shp_insulin.volume_m3,
+            minutes_until_spoilage=inc_active.minutes_until_spoilage,
+            num_compatible_nearby=3,
+            cargo_value_inr=shp_insulin.value_inr,
+            carrier_trust_score=94.0,
+        )
+        quote_metro = calculate_price(
+            distance_km=19.2,
+            requires_refrigeration=True,
+            weight_kg=shp_insulin.weight_kg,
+            volume_m3=shp_insulin.volume_m3,
+            minutes_until_spoilage=inc_active.minutes_until_spoilage,
+            num_compatible_nearby=3,
+            cargo_value_inr=shp_insulin.value_inr,
+            carrier_trust_score=75.0,
+        )
+
         off_north = RescueOffer(
             id="off_north_412_ins",
             incident_id=inc_active.id,
@@ -563,9 +671,10 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
             carrier_company_id=northline.id,
             carrier_truck_id=trk_north_412.id,
             offer_round=1,
-            price_total_inr=24500.0,
-            carrier_payout_inr=23275.0,
-            platform_fee_inr=1225.0,
+            price_total_inr=quote_north.total_inr,
+            carrier_payout_inr=quote_north.carrier_payout_inr,
+            platform_fee_inr=quote_north.platform_fee_inr,
+            price_breakdown_json=quote_north.to_dict(),
             eta_minutes=18.0,
             distance_km=8.4,
             rescue_score=92.0,
@@ -587,9 +696,10 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
             carrier_company_id=metro.id,
             carrier_truck_id=trk_metro_3320.id,
             offer_round=1,
-            price_total_inr=28000.0,
-            carrier_payout_inr=26600.0,
-            platform_fee_inr=1400.0,
+            price_total_inr=quote_metro.total_inr,
+            carrier_payout_inr=quote_metro.carrier_payout_inr,
+            platform_fee_inr=quote_metro.platform_fee_inr,
+            price_breakdown_json=quote_metro.to_dict(),
             eta_minutes=34.0,
             distance_km=19.2,
             rescue_score=81.0,
@@ -657,6 +767,101 @@ async def seed(password: str | None, reset: bool) -> list[tuple[str, str, str]]:
             memo="Platform fee 5%",
         )
         session.add_all([led_p1, led_p2, led_p3])
+        await session.flush()
+
+        # ------------------------------------------------------------------
+        # 7b. Safe storage network (relay destinations)
+        # ------------------------------------------------------------------
+        # Shared infrastructure along the Mumbai-Pune corridor. Deliberately
+        # a mix: two cold stores with different temperature floors, a bonded
+        # warehouse that cannot chill at all, a hazmat depot, and one site
+        # that closes overnight. A relay list where every option works is not
+        # a decision, and the console has to be able to show a real one.
+        facilities = [
+            StorageFacility(
+                id="stor_bhiwandi_cold",
+                name="Bhiwandi Cold Chain Hub",
+                latitude=19.2963,
+                longitude=73.0631,
+                address="Kalyan-Bhiwandi Road, Bhiwandi, Thane",
+                contact_phone="+91-22-2597-4410",
+                refrigerated=True,
+                min_temp_c=-25.0,
+                max_temp_c=8.0,
+                hazmat_approved=False,
+                capacity_m3=4200.0,
+                available_m3=980.0,
+                handling_fee_inr=2400.0,
+                storage_fee_inr_per_m3_day=185.0,
+                open_24h=True,
+            ),
+            StorageFacility(
+                id="stor_chakan_pharma",
+                name="Chakan Pharma Cold Store",
+                operator_company_id=northline.id,
+                latitude=18.7606,
+                longitude=73.8636,
+                address="MIDC Phase II, Chakan, Pune",
+                contact_phone="+91-20-6710-3388",
+                refrigerated=True,
+                min_temp_c=-20.0,
+                max_temp_c=8.0,
+                hazmat_approved=False,
+                capacity_m3=2600.0,
+                available_m3=640.0,
+                handling_fee_inr=2100.0,
+                storage_fee_inr_per_m3_day=210.0,
+                open_24h=True,
+            ),
+            StorageFacility(
+                id="stor_panvel_bonded",
+                name="Panvel Bonded Warehouse",
+                latitude=18.9894,
+                longitude=73.1175,
+                address="JNPT Feeder Road, Panvel, Raigad",
+                contact_phone="+91-22-2745-9001",
+                refrigerated=False,
+                hazmat_approved=False,
+                capacity_m3=8800.0,
+                available_m3=3100.0,
+                handling_fee_inr=1450.0,
+                storage_fee_inr_per_m3_day=95.0,
+                open_24h=True,
+            ),
+            StorageFacility(
+                id="stor_talegaon_hazmat",
+                name="Talegaon Hazardous Goods Depot",
+                latitude=18.7351,
+                longitude=73.6759,
+                address="Talegaon MIDC, Pune",
+                contact_phone="+91-20-6633-2200",
+                refrigerated=False,
+                hazmat_approved=True,
+                capacity_m3=3400.0,
+                available_m3=1250.0,
+                handling_fee_inr=3800.0,
+                storage_fee_inr_per_m3_day=240.0,
+                open_24h=True,
+            ),
+            StorageFacility(
+                id="stor_lonavala_transit",
+                name="Lonavala Transit Cold Room",
+                latitude=18.7546,
+                longitude=73.4062,
+                address="Old Mumbai-Pune Highway, Lonavala",
+                contact_phone="+91-2114-27-3310",
+                refrigerated=True,
+                min_temp_c=2.0,
+                max_temp_c=10.0,
+                hazmat_approved=False,
+                capacity_m3=900.0,
+                available_m3=180.0,
+                handling_fee_inr=1800.0,
+                storage_fee_inr_per_m3_day=160.0,
+                open_24h=False,
+            ),
+        ]
+        session.add_all(facilities)
         await session.flush()
 
         # ------------------------------------------------------------------
@@ -1156,6 +1361,7 @@ def main() -> int:
     print("  • 5 Shipments (Active cold-chain, precision electronics, cryo plasma, oncology API)")
     print("  • 1 Urgent active breakdown incident with countdown & rescue offers")
     print("  • 1 Historic completed rescue with full audit trail")
+    print("  • 5 Safe-storage facilities for cargo relay (cold, bonded, hazmat)")
     print("  • 1 Settled escrow with balanced double-entry ledger postings")
     print("    (the live rescue opens its own escrow when you confirm the offer)")
     print("  • 23 Cold-chain temperature telemetry logs & critical excursion alerts")

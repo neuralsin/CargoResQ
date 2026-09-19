@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     jwt_secret: str = os.getenv("JWT_SECRET", "dev-only-change-this-cargoresq-secret")
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 120
+
+    #: How long a driver can stay signed in without re-entering a
+    #: password. Matched to a working roster rather than a session:
+    #: the phone is the driver's own, held by the person it belongs
+    #: to, and signing them out mid-shift is the worse risk.
+    refresh_token_expire_days: int = 30
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379")
     kafka_bootstrap_servers: str = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "")
     environment: str = os.getenv("ENVIRONMENT", "development")

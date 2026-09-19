@@ -7,7 +7,8 @@ audit trail's `actor_id` was a free-text request field defaulting to the
 literal "ops" -- so an anonymous caller could drive any carrier's incident to
 ESCROW_RELEASED and the trail would record it as an internal action.
 """
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -16,13 +17,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.core_api.app.auth import actor_id_of, get_current_company, get_current_principal
 from services.core_api.app.events.producer import event_producer
-from services.core_api.app.models import Shipment
+from services.core_api.app.models import Company, Shipment, Truck
+from services.matching_engine.app.routing import haversine_distance_km
+from services.telemetry.app.models import TruckLiveState
 from shared.database import get_db
 from shared.observability import logger
 
 from .authz import load_incident_for_owner
 from .dispatch import escrow_for_incident, sync_escrow_to_incident
 from .models import Incident, IncidentState
+from .offer_models import OfferState, RescueOffer
+from .stand_down import CannotStandDown, stand_down_incident
 from .orchestrator import (
     IllegalTransition,
     IncidentNotFound,
@@ -67,13 +72,33 @@ def _incident_view(incident: Incident, shipment: Optional[Shipment] = None) -> d
         "minutesUntilSpoilage": incident.minutes_until_spoilage,
         "createdAt": incident.created_at.isoformat() if incident.created_at else None,
         "updatedAt": incident.updated_at.isoformat() if incident.updated_at else None,
+        # Present on every incident view so a relayed load never renders as
+        # though it is still heading to the customer.
+        "relayFacilityId": incident.relay_facility_id,
+        "relayReason": incident.relay_reason,
+        "relayCommittedAt": (
+            incident.relay_committed_at.isoformat()
+            if incident.relay_committed_at
+            else None
+        ),
     }
     if shipment is not None:
         payload["cargoType"] = shipment.cargo_type
         payload["requiresRefrigeration"] = shipment.requires_refrigeration
         payload["requiredMaxTempC"] = shipment.required_max_temp_c
         payload["isHazmat"] = shipment.is_hazmat
+        payload["volumeM3"] = shipment.volume_m3
+        payload["weightKg"] = shipment.weight_kg
+        payload["destinationName"] = shipment.destination_name
+        payload["destinationLat"] = shipment.destination_lat
+        payload["destinationLng"] = shipment.destination_lng
     return payload
+
+
+class StandDownIncidentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Optional[str] = Field(None, max_length=280)
 
 
 @router.post("/incidents", status_code=status.HTTP_201_CREATED)
@@ -143,7 +168,85 @@ async def list_company_incidents(
                     "stateReason": escrow.state_reason,
                 }
 
+    await attach_rescuer_positions(db, incidents)
     return incidents
+
+
+async def attach_rescuer_positions(
+    db: AsyncSession, incidents: List[Dict[str, Any]]
+) -> None:
+    """Put the incoming rescue truck on each bound incident.
+
+    An owner watching a rescue could see their own stranded truck and nothing
+    else: the vehicle actually coming to help belongs to another company, so
+    it appeared in none of their fleet queries and on none of their maps. The
+    single most useful thing on the screen was the one thing missing from it.
+
+    Only for rescues that are bound. Before both sides agree there is no
+    rescuer yet, and showing a candidate's position would imply a commitment
+    nobody has made.
+    """
+    incident_ids = [i["id"] for i in incidents if i.get("id")]
+    if not incident_ids:
+        return
+
+    result = await db.execute(
+        select(RescueOffer)
+        .where(RescueOffer.incident_id.in_(incident_ids))
+        .where(RescueOffer.state == OfferState.BOUND.value)
+    )
+    bound = {o.incident_id: o for o in result.scalars().all()}
+    if not bound:
+        return
+
+    for payload in incidents:
+        offer = bound.get(payload["id"])
+        if offer is None or not offer.carrier_truck_id:
+            continue
+
+        truck = await db.get(Truck, offer.carrier_truck_id)
+        if truck is None:
+            continue
+        company = await db.get(Company, offer.carrier_company_id)
+        live = await db.get(TruckLiveState, truck.id)
+
+        if live is not None and live.latitude is not None:
+            lat, lng = live.latitude, live.longitude
+            seen = live.last_received_at
+            is_live = seen is not None and (
+                (seen if seen.tzinfo else seen.replace(tzinfo=timezone.utc))
+                >= datetime.now(timezone.utc) - timedelta(minutes=10)
+            )
+            speed = live.speed_kph
+        else:
+            lat, lng = truck.latitude, truck.longitude
+            is_live = False
+            speed = None
+            seen = None
+
+        distance_km = None
+        if lat is not None and lng is not None:
+            distance_km = round(
+                haversine_distance_km(payload["lat"], payload["lng"], lat, lng), 2
+            )
+
+        payload["rescuer"] = {
+            "companyName": company.name if company else "Rescuing carrier",
+            "truckId": truck.id,
+            "registrationNumber": truck.registration_number,
+            "latitude": lat,
+            "longitude": lng,
+            "speedKph": speed,
+            "positionIsLive": is_live,
+            "lastSeenAt": seen.isoformat() if seen else None,
+            "distanceKm": distance_km,
+            "etaMinutes": (
+                round((distance_km * 1.3 / 45.0) * 60.0, 1)
+                if distance_km is not None
+                else None
+            ),
+            "arrived": distance_km is not None and distance_km <= 0.4,
+        }
 
 
 @router.get("/incidents/{id}")
@@ -224,6 +327,32 @@ async def advance_incident_state(
         payload["escrow"] = {"id": escrow.id, "state": escrow.state}
     return payload
 
+
+
+@router.post("/incidents/{id}/stand-down")
+async def stand_down_incident_route(
+    id: str,
+    req: StandDownIncidentRequest,
+    principal: Dict[str, Any] = Depends(get_current_principal),
+    db: AsyncSession = Depends(get_db),
+):
+    """Take back a breakdown that turned out not to be one.
+
+    Distinct from advancing to CANCELLED by hand: that would close the
+    incident and leave the offers, the escrow hold and the rescuer's truck
+    exactly as they were. This unwinds all of it in one go.
+    """
+    incident, _shipment = await load_incident_for_owner(id, principal, db)
+    try:
+        return await stand_down_incident(
+            db,
+            incident,
+            actor_id=actor_id_of(principal),
+            reason=req.reason or "",
+            event_publisher=event_producer.publish,
+        )
+    except CannotStandDown as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
 
 @router.get("/incidents/{id}/timeline")
 async def get_timeline(

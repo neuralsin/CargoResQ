@@ -34,6 +34,7 @@ from services.core_api.app.events.producer import event_producer
 from services.escrow_ledger.app.router import router as escrow_router
 from services.matching_engine.app.router import router as matching_router
 from services.orchestrator.app.offers_router import router as offers_router
+from services.orchestrator.app.relay_router import router as relay_router
 from services.orchestrator.app.router import router as orchestrator_router
 from services.pricing_engine.app.router import router as pricing_router
 from services.realtime_gateway.app.connection_manager import Principal, manager
@@ -130,6 +131,7 @@ app.include_router(pricing_router)
 app.include_router(escrow_router)
 app.include_router(orchestrator_router)
 app.include_router(offers_router)
+app.include_router(relay_router)
 app.include_router(simulation_router)
 app.include_router(driver_router)
 app.include_router(telemetry_router)

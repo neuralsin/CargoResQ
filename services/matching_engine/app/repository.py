@@ -50,6 +50,7 @@ def _is_compatible(
     is_hazmat: bool,
     volume_m3: float,
     weight_kg: float,
+    ignore_capacity: bool = False,
 ) -> tuple[bool, List[str]]:
     """Check one truck against the cargo, and say what failed.
 
@@ -69,10 +70,15 @@ def _is_compatible(
                 )
     if is_hazmat and not truck.hazmat_certified:
         failures.append("not hazmat certified")
-    if truck.max_volume_m3 < volume_m3:
-        failures.append(f"volume {truck.max_volume_m3}m3 < {volume_m3}m3 required")
-    if truck.max_weight_kg < weight_kg:
-        failures.append(f"payload {truck.max_weight_kg}kg < {weight_kg}kg required")
+    # Capacity is skipped when planning a split: a truck that can take half
+    # the pallets is not an incompatible truck, it is half the answer. The
+    # temperature and hazmat checks above are never skipped, because carrying
+    # part of a load badly is no better than carrying all of it badly.
+    if not ignore_capacity:
+        if truck.max_volume_m3 < volume_m3:
+            failures.append(f"volume {truck.max_volume_m3}m3 < {volume_m3}m3 required")
+        if truck.max_weight_kg < weight_kg:
+            failures.append(f"payload {truck.max_weight_kg}kg < {weight_kg}kg required")
 
     return (not failures), failures
 
@@ -89,6 +95,7 @@ async def find_candidates(
     radius_km: float = 50.0,
     limit: int = 5,
     exclude_truck_ids: Optional[List[str]] = None,
+    ignore_capacity: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return compatible idle trucks within the radius, nearest first.
 
@@ -132,7 +139,13 @@ async def find_candidates(
             continue
 
         compatible, failures = _is_compatible(
-            truck, requires_refrigeration, required_max_temp, is_hazmat, volume_m3, weight_kg
+            truck,
+            requires_refrigeration,
+            required_max_temp,
+            is_hazmat,
+            volume_m3,
+            weight_kg,
+            ignore_capacity=ignore_capacity,
         )
         if not compatible:
             continue

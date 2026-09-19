@@ -10,6 +10,15 @@ package com.cargoresq.driver.model
 
 data class DriverSession(
     val token: String,
+    /**
+     * Exchanged for a new access token when the short one expires.
+     *
+     * Without this a driver was signed out roughly two hours into a shift and
+     * every call started failing with "unauthorised" until they typed their
+     * password again -- usually while stopped at the side of a road, which is
+     * exactly when the app has to work.
+     */
+    val refreshToken: String,
     val driverId: String,
     val driverName: String,
     val companyId: String,
@@ -59,6 +68,20 @@ data class IncidentInfo(
     val cargoType: String?,
     val state: String,
     val minutesUntilSpoilage: Double?,
+)
+
+/**
+ * What standing a breakdown down actually undid.
+ *
+ * Reported back rather than swallowed, because "cancelled" and "cancelled,
+ * and two carriers who were holding a truck for you have been told" are
+ * different things and the driver should see which one happened.
+ */
+data class StandDownResult(
+    val incidentId: String,
+    val state: String,
+    val offersWithdrawn: Int,
+    val escrowsReversed: Int,
 )
 
 /**
@@ -147,4 +170,39 @@ enum class SosSeverity(val wire: String, val label: String) {
     CRITICAL("CRITICAL", "Life threatening"),
     HIGH("HIGH", "Urgent"),
     MODERATE("MODERATE", "Needs help"),
+}
+
+/**
+ * The other truck in this rescue, and how far away it is.
+ *
+ * A bound rescue has two drivers who each need exactly one thing about the
+ * other: where they are and how long until they meet. The stranded driver is
+ * stood beside a warming load wondering whether help is real; the rescuer is
+ * hunting for a stopped truck somewhere ahead in the dark.
+ *
+ * Carries no price and no cargo value. A driver is told what they are moving,
+ * never what it is worth or what the job pays.
+ */
+data class CounterpartLink(
+    val myRole: String,
+    val incidentId: String,
+    val incidentState: String,
+    val companyName: String,
+    val driverName: String?,
+    val driverPhone: String?,
+    val registrationNumber: String?,
+    val refrigerated: Boolean,
+    val latitude: Double?,
+    val longitude: Double?,
+    val speedKph: Double?,
+    val positionIsLive: Boolean,
+    val lastSeenAt: String?,
+    val distanceKm: Double?,
+    val etaMinutes: Double?,
+    val arrived: Boolean,
+    val cargoType: String?,
+    val minutesUntilSpoilage: Double?,
+) {
+    /** True when I am the one who broke down. */
+    val iAmStranded: Boolean get() = myRole == "STRANDED"
 }

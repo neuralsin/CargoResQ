@@ -12,7 +12,9 @@ Run with:
 from __future__ import annotations
 
 import json
+import logging
 import os
+import queue
 import threading
 from pathlib import Path
 from tkinter import messagebox
@@ -117,6 +119,39 @@ ESCROW_STATE_TEXT = {
 }
 
 REFRESH_INTERVAL_MS = 15_000
+
+#: How often the UI thread checks for work handed back by background
+#: threads. Short enough to feel immediate, long enough to be free.
+CALLBACK_DRAIN_MS = 40
+
+#: What the four headline cards say before the first fetch returns.
+#:
+#: The titles never change, so there is no reason to paint them blank and
+#: then fill them in -- an em dash reads as "not measured yet", while an
+#: empty card with a 0 in it reads as a real count of zero.
+#: Incident states where nothing further is going to happen.
+TERMINAL_INCIDENT_STATES = {"ESCROW_RELEASED", "CANCELLED", "DISPUTED"}
+
+#: States a breakdown can still be taken back from, mirroring the server
+#: rule in services/orchestrator/app/stand_down.py. The cut is where the
+#: cargo stops being on its own truck.
+STAND_DOWN_STATES = {
+    "BREAKDOWN_REPORTED",
+    "TRIAGING",
+    "MATCHING",
+    "RESCUE_OFFERED",
+    "RESCUE_ACCEPTED",
+    "DRIVER_EN_ROUTE",
+}
+
+STAT_PLACEHOLDERS = [
+    ("Open incidents", "checking..."),
+    ("Fleet reporting", "checking..."),
+    ("Open alerts", "checking..."),
+    ("Active SOS", "checking..."),
+]
+
+
 EVENT_POLL_MS = 400
 
 TABS = [
@@ -148,6 +183,32 @@ def load_demo_accounts() -> List[Dict[str, str]]:
     except (OSError, ValueError):
         return []
     return [a for a in accounts if a.get("email") and a.get("password")]
+
+
+
+
+def _multiplier_text(value: Optional[float]) -> str:
+    """A multiplier as a person reads it: the factor and what it did."""
+    if value is None:
+        return "--"
+    pct = (value - 1.0) * 100
+    if abs(pct) < 0.5:
+        return f"x{value:.2f}  (no change)"
+    direction = "more" if pct > 0 else "less"
+    return f"x{value:.2f}  ({abs(pct):.0f}% {direction})"
+
+
+def _short_label(text: str, limit: int = 18) -> str:
+    """Trim a marker label to something that fits beside a pin.
+
+    Map labels are drawn unclipped at a fixed size, so a 38-character cargo
+    description does not wrap or shrink -- it simply lies across whatever else
+    is nearby. The full text is still available in the marker detail.
+    """
+    text = str(text).strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
 
 
 class LoginView(ctk.CTkFrame):
@@ -270,15 +331,38 @@ class LoginView(ctk.CTkFrame):
         self.button.configure(state="disabled", text="Signing in...")
         self.status.configure(text="")
 
+        # The worker records its outcome; the UI thread picks it up on its
+        # own timer. Calling self.after() from the worker is the same
+        # cross-thread Tk call that made background work silently vanish
+        # elsewhere in this console, and here it would strand the operator
+        # on a "Signing in..." button that never comes back.
+        self._login_result: Optional[tuple] = None
+
         def work():
             try:
                 self.master_app.connect(API_ENDPOINT, email, password)
-                self.after(0, self.master_app.show_dashboard)
+                self._login_result = ("ok", None)
             except Exception as exc:
-                err_msg = str(exc)
-                self.after(0, lambda m=err_msg: self._on_error(m))
+                self._login_result = ("error", str(exc))
 
         threading.Thread(target=work, daemon=True).start()
+        self.after(60, self._poll_login)
+
+    def _poll_login(self) -> None:
+        result = getattr(self, "_login_result", None)
+        if result is None:
+            try:
+                if self.winfo_exists():
+                    self.after(60, self._poll_login)
+            except Exception:
+                pass
+            return
+        outcome, message = result
+        self._login_result = None
+        if outcome == "ok":
+            self.master_app.show_dashboard()
+        else:
+            self._on_error(message or "Sign in failed")
 
     def _on_error(self, message: str) -> None:
         try:
@@ -304,6 +388,16 @@ class DashboardView(ctk.CTkFrame):
         self.own_sos: List[Dict[str, Any]] = []
         self.nearby_sos: List[Dict[str, Any]] = []
         self.inbox: List[Dict[str, Any]] = []
+        # Safe-storage network. Fixed infrastructure, so it is fetched once
+        # rather than on every tick.
+        self.facilities: List[Dict[str, Any]] = []
+        # Offers on our own incidents, keyed by incident id. The inbox above
+        # is the opposite direction -- what other carriers have asked of us.
+        self.outgoing_offers: Dict[str, List[Dict[str, Any]]] = {}
+        # Rescues we are performing for somebody else. The mirror
+        # image of self.incidents, which are the ones we need help
+        # with.
+        self.active_rescues: List[Dict[str, Any]] = []
         self.selected_incident_id: Optional[str] = None
         self.selected_offers: List[Dict[str, Any]] = []
 
@@ -318,8 +412,13 @@ class DashboardView(ctk.CTkFrame):
 
         self._data_signatures: Dict[str, Any] = {}
 
+        # Work finished on background threads is posted here and run by the
+        # UI thread. See _safe_after.
+        self._callbacks: "queue.Queue[Callable[[], Any]]" = queue.Queue()
+
         self._build_sidebar()
         self._build_main()
+        self._drain_callbacks()
         self.start_live_feed()
         self.refresh()
         self.after(EVENT_POLL_MS, self._poll_events)
@@ -401,7 +500,8 @@ class DashboardView(ctk.CTkFrame):
         self.stats.grid(row=1, column=0, sticky="ew", pady=(0, 14))
         for i in range(4):
             self.stats.grid_columnconfigure(i, weight=1)
-            sc = StatCard(self.stats, "", "0", "")
+            title, detail = STAT_PLACEHOLDERS[i]
+            sc = StatCard(self.stats, title, "—", detail)
             sc.grid(
                 row=0, column=i, sticky="ew",
                 padx=(0 if i == 0 else 6, 0 if i == 3 else 6),
@@ -460,12 +560,33 @@ class DashboardView(ctk.CTkFrame):
             ("own_sos", client.active_sos),
             ("nearby_sos", client.nearby_sos),
             ("inbox", client.offer_inbox),
+            ("active_rescues", client.active_rescues),
         ]:
             try:
                 payload[key] = call()
             except ApiError as exc:
                 payload[key] = []
                 errors.append(f"{key}: {exc}")
+
+        # The storage network does not change during a shift.
+        if not self.facilities:
+            try:
+                payload["facilities"] = client.storage_facilities()
+            except ApiError as exc:
+                errors.append(f"storage: {exc}")
+
+        # Offers we have sent out, so the console can show both halves of the
+        # handshake rather than only the requests coming towards us.
+        outgoing: Dict[str, List[Dict[str, Any]]] = {}
+        for incident in payload.get("incidents", [])[:8]:
+            if incident.get("state") in TERMINAL_INCIDENT_STATES:
+                continue
+            try:
+                outgoing[incident["id"]] = client.incident_offers(incident["id"])
+            except ApiError:
+                # One incident's offers failing must not blank the board.
+                continue
+        payload["outgoing"] = outgoing
 
         self._safe_after(lambda: self._apply(payload, errors))
 
@@ -477,6 +598,10 @@ class DashboardView(ctk.CTkFrame):
         self.own_sos = payload.get("own_sos", [])
         self.nearby_sos = payload.get("nearby_sos", [])
         self.inbox = payload.get("inbox", [])
+        self.active_rescues = payload.get("active_rescues", [])
+        if payload.get("facilities"):
+            self.facilities = payload["facilities"]
+        self.outgoing_offers = payload.get("outgoing", {})
 
         from datetime import datetime
 
@@ -489,8 +614,9 @@ class DashboardView(ctk.CTkFrame):
         self._update_tab(self.active_tab)
 
     def _render_stats(self) -> None:
-        terminal = {"ESCROW_RELEASED", "CANCELLED", "DISPUTED"}
-        open_incidents = [i for i in self.incidents if i.get("state") not in terminal]
+        open_incidents = [
+            i for i in self.incidents if i.get("state") not in TERMINAL_INCIDENT_STATES
+        ]
         critical = [a for a in self.alerts if a.get("severity") == "CRITICAL"]
         live_trucks = [t for t in self.fleet if t.get("positionIsLive")]
 
@@ -547,10 +673,17 @@ class DashboardView(ctk.CTkFrame):
 
     def _tab_signature(self, name: str) -> Any:
         if name == "Command centre":
+            # The map and the rescue panel live on this tab, so fleet
+            # positions and rescues we are performing are part of what it
+            # shows. Leaving them out meant a carrier with no incidents of
+            # their own had a signature that never changed -- their console
+            # fetched data every fifteen seconds and redrew none of it.
             return (
                 len(self.incidents),
                 tuple(
-                    (i.get("id"), i.get("state"), i.get("minutesUntilSpoilage"))
+                    (i.get("id"), i.get("state"), i.get("minutesUntilSpoilage"),
+                     i.get("relayFacilityId"),
+                     (i.get("rescuer") or {}).get("distanceKm"))
                     for i in self.incidents
                 ),
                 self.selected_incident_id,
@@ -559,13 +692,34 @@ class DashboardView(ctk.CTkFrame):
                     (o.get("id"), o.get("state"), o.get("priceTotalInr"))
                     for o in self.selected_offers
                 ),
+                tuple(
+                    (
+                        t.get("truckId") or t.get("id"),
+                        t.get("latitude"),
+                        t.get("longitude"),
+                        t.get("positionIsLive"),
+                    )
+                    for t in self.fleet
+                ),
+                tuple(
+                    (r.get("offerId"), r.get("incidentState"), r.get("distanceKm"))
+                    for r in self.active_rescues
+                ),
             )
         elif name == "Rescue offers":
+            # Both halves of this tab, not just the inbox: the outgoing board
+            # is where an owner watches carriers respond, and it has to move
+            # when they do.
             return (
                 len(self.inbox),
                 tuple(
                     (o.get("id"), o.get("state"), o.get("payoutInr"))
                     for o in self.inbox
+                ),
+                tuple(
+                    (incident_id, o.get("id"), o.get("state"), o.get("priceTotalInr"))
+                    for incident_id, offers in sorted(self.outgoing_offers.items())
+                    for o in offers
                 ),
             )
         elif name == "Fleet":
@@ -713,8 +867,10 @@ class DashboardView(ctk.CTkFrame):
             label = str(truck.get("registrationNumber", t_id))
             if suspect:
                 # Marked on the pin itself. A position the system does not
-                # believe should not look identical to one it does.
-                label += "  (unverified)"
+                # believe should not look identical to one it does. Kept to a
+                # single glyph: at country zoom the word "unverified" spans
+                # three other pins.
+                label += " ⚠"
             specs[f"truck:{t_id}"] = {
                 "lat": float(lat),
                 "lng": float(lng),
@@ -733,8 +889,32 @@ class DashboardView(ctk.CTkFrame):
             specs[f"incident:{incident['id']}"] = {
                 "lat": float(lat),
                 "lng": float(lng),
-                "text": str(incident.get("cargoType") or "Incident"),
+                "text": _short_label(incident.get("cargoType") or "Incident"),
                 "kind": "incident",
+                "detail": f"{state_label(incident.get('state', ''))} | "
+                          f"{minutes_label(incident.get('minutesUntilSpoilage'))} left",
+            }
+            positions.append((float(lat), float(lng)))
+
+        # The truck coming to help. It belongs to another company, so it is
+        # in none of our fleet queries -- and it is the thing the operator is
+        # actually waiting for.
+        for incident in self.incidents:
+            rescuer = incident.get("rescuer")
+            if not rescuer:
+                continue
+            lat, lng = rescuer.get("latitude"), rescuer.get("longitude")
+            if lat is None or lng is None:
+                continue
+            specs[f"rescuer:{incident['id']}"] = {
+                "lat": float(lat),
+                "lng": float(lng),
+                "text": _short_label(rescuer.get("registrationNumber") or "Rescuer", 14),
+                "kind": "rescuer",
+                "detail": (
+                    f"{rescuer.get('companyName')} | "
+                    f"{rescuer.get('distanceKm')} km out"
+                ),
             }
             positions.append((float(lat), float(lng)))
 
@@ -760,17 +940,67 @@ class DashboardView(ctk.CTkFrame):
             specs[f"sos_nearby:{a_id}"] = {
                 "lat": float(alat),
                 "lng": float(alng),
-                "text": f"Nearby SOS {alert.get('category', '')}",
+                "text": f"SOS {alert.get('category', '')}",
                 "kind": "sos",
             }
             positions.append((float(alat), float(alng)))
 
+        # Safe storage sites. Shown always rather than only once a relay is
+        # being considered: an operator deciding whether the journey can be
+        # completed needs to already know what the fallbacks look like.
+        chosen = {
+            i.get("relayFacilityId")
+            for i in self.incidents
+            if i.get("relayFacilityId")
+        }
+        for facility in self.facilities:
+            lat, lng = facility.get("latitude"), facility.get("longitude")
+            if lat is None or lng is None:
+                continue
+            is_chosen = facility.get("id") in chosen
+            specs[f"storage:{facility['id']}"] = {
+                "lat": float(lat),
+                "lng": float(lng),
+                "text": _short_label(facility.get("name", "Storage"), 16),
+                "kind": "storage_chosen" if is_chosen else "storage",
+                "detail": (
+                    f"{facility.get('availableM3', 0):.0f} m3 free"
+                    + (
+                        f" | chills to {facility.get('minTempC')}C"
+                        if facility.get("refrigerated")
+                        else " | ambient"
+                    )
+                ),
+            }
+            # Depots are fixed infrastructure spread over a wide area. Letting
+            # them drive the viewport would zoom the map out past the incident
+            # everybody is actually looking at.
+            if is_chosen:
+                positions.append((float(lat), float(lng)))
+
+        # The truck we have been sent to rescue. Not our fleet, so it
+        # appears in none of the lists above -- but it is the single most
+        # important point on the map for a carrier performing a rescue.
+        for rescue in self.active_rescues:
+            stranded = rescue.get("strandedTruck") or {}
+            lat = stranded.get("latitude", rescue.get("breakdownLat"))
+            lng = stranded.get("longitude", rescue.get("breakdownLng"))
+            if lat is None or lng is None:
+                continue
+            specs[f"rescue:{rescue['incidentId']}"] = {
+                "lat": float(lat),
+                "lng": float(lng),
+                "text": _short_label(
+                    stranded.get("registrationNumber") or "Stranded", 14
+                ),
+                "kind": "incident",
+                "detail": f"Rescue for {rescue.get('customerCompany')}",
+            }
+            positions.append((float(lat), float(lng)))
+
         panel.sync_markers(specs)
 
-        pos_tuple = tuple(sorted(positions))
-        if getattr(panel, "_last_positions", None) != pos_tuple:
-            panel.fit_to_markers(positions)
-            panel._last_positions = pos_tuple
+        panel.maybe_fit(positions)
 
         stale = len([t for t in self.fleet if not t.get("positionIsLive")])
         panel.set_status(
@@ -786,6 +1016,13 @@ class DashboardView(ctk.CTkFrame):
             child.destroy()
 
         if not self.selected_incident_id:
+            if self.active_rescues:
+                # A pure rescuer owns no incidents, so "select an incident"
+                # is an empty instruction. Show them the job they are on.
+                holder = scrollable(self.detail_card)
+                holder.pack(fill="both", expand=True, padx=14, pady=14)
+                self._render_active_rescues(holder)
+                return
             EmptyState(
                 self.detail_card,
                 "Select an incident",
@@ -853,8 +1090,22 @@ class DashboardView(ctk.CTkFrame):
                 lambda: self._settle_incident(incident),
             ).pack(side="left", padx=(0, 8))
 
+        # Two things to do when a rescue is not the answer. Both sit next to
+        # the rescue actions rather than behind a menu, because the moment
+        # they matter is the moment the rescue is not working.
+        if state not in TERMINAL_INCIDENT_STATES:
+            secondary_button(
+                actions,
+                "Relay to storage",
+                lambda: self._open_relay(incident),
+                width=126,
+            ).pack(side="left", padx=(0, 8))
+            secondary_button(
+                actions, "Split load", lambda: self._open_split(incident), width=92
+            ).pack(side="left", padx=(0, 8))
+
         secondary_button(
-            actions, "Audit trail", lambda: self._show_timeline(incident["id"]), width=110
+            actions, "Audit trail", lambda: self._show_timeline(incident["id"]), width=104
         ).pack(side="left", padx=(0, 8))
 
         escrow = incident.get("escrow")
@@ -863,14 +1114,33 @@ class DashboardView(ctk.CTkFrame):
                 actions,
                 "Escrow",
                 lambda e=escrow: self._show_escrow({"escrowId": e["id"]}),
-                width=90,
+                width=84,
+            ).pack(side="left", padx=(0, 8))
+
+        # Standing down is the way out of a breakdown that was not one. It is
+        # not offered once the cargo has moved, because by then there is a
+        # real rescue in progress that has to be resolved rather than erased.
+        if state in STAND_DOWN_STATES:
+            secondary_button(
+                actions,
+                "Stand down",
+                lambda: self._stand_down(incident),
+                width=104,
             ).pack(side="left")
+
+        # -- diverted cargo ----------------------------------------------
+        if incident.get("relayFacilityId"):
+            self._render_relay_strip(container, incident)
+
+        self._render_rescuer_strip(container, incident)
 
         # -- where the money is -----------------------------------------
         if escrow:
             self._render_escrow_strip(container, escrow, state)
         else:
             self._render_escrow_pending(container)
+
+        self._render_active_rescues(container)
 
         eyebrow(container, "Rescue offers").pack(anchor="w", pady=(6, 6))
         if not self.selected_offers:
@@ -1017,75 +1287,154 @@ class DashboardView(ctk.CTkFrame):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _render_offer_card(self, master: Any, offer: Dict[str, Any]) -> None:
-        holder = card(master, fg_color=COLORS["row"])
+    def _render_offer_card(
+        self,
+        master: Any,
+        offer: Dict[str, Any],
+        is_best: bool = False,
+        compact: bool = False,
+    ) -> None:
+        """One carrier's offer, with everything needed to choose between them.
+
+        An owner comparing rescues is weighing four things at once: what it
+        costs, how fast it arrives, whether the truck can actually hold the
+        cargo, and whether the company has done this well before. All four
+        live on the card, because putting any of them one click away means
+        the decision gets made without it.
+        """
+        holder = card(
+            master,
+            fg_color=COLORS["teal_soft"] if is_best else COLORS["row"],
+            border_width=1,
+            border_color=COLORS["teal"] if is_best else COLORS["line"],
+        )
         holder.pack(fill="x", pady=5)
 
         row = ctk.CTkFrame(holder, fg_color="transparent")
-        row.pack(fill="x", padx=14, pady=(12, 4))
-        heading(row, money(offer.get("priceTotalInr")), size=15).pack(side="left")
+        row.pack(fill="x", padx=14, pady=(12, 2))
+        heading(row, money(offer.get("priceTotalInr")), size=16).pack(side="left")
         fg, bg = state_color(offer.get("state", ""))
         badge(row, state_label(offer.get("state", "")), fg, bg).pack(side="right")
+        if is_best:
+            badge(row, "Best price", COLORS["teal"], COLORS["teal_soft"]).pack(
+                side="right", padx=(0, 6)
+            )
 
-        meta = (
-            f"ETA {minutes_label(offer.get('etaMinutes'))}  |  "
-            f"{offer.get('distanceKm', 0):.1f} km  |  "
-            f"score {offer.get('rescueScore', 0):.0f}"
-        )
+        # Who. An offer identified by a company id is not a decision.
+        name_row = ctk.CTkFrame(holder, fg_color="transparent")
+        name_row.pack(fill="x", padx=14, pady=(0, 2))
+        body(
+            name_row,
+            offer.get("carrierCompanyName") or "Unknown carrier",
+            size=12,
+            color=COLORS["ink"],
+        ).pack(side="left")
+
+        meta = f"ETA {minutes_label(offer.get('etaMinutes'))}"
+        if offer.get("distanceKm") is not None:
+            meta += f"  |  {offer['distanceKm']:.1f} km"
+        if offer.get("rescueScore") is not None:
+            meta += f"  |  match {offer['rescueScore']:.0f}/100"
         body(holder, meta, size=11).pack(anchor="w", padx=14)
 
-        # The carrier's reputation, shown at the moment of the decision --
-        # this is who the owner is about to trust with their cargo.
-        reputation = offer.get("carrierReputation") or {}
-        if reputation:
-            if reputation.get("isNewCounterparty"):
-                rep_text = "New to the network -- no completed rescues yet"
-                rep_color = COLORS["amber"]
-            else:
-                stars = reputation.get("averageStars")
-                rep_text = (
-                    f"Trust {reputation.get('trustScore')}  |  "
-                    f"{reputation.get('rescuesCompleted')} rescues"
-                    + (f"  |  {stars:.1f}/5 from {reputation.get('ratingCount')}" if stars else "")
-                )
-                rep_color = COLORS["teal"] if reputation.get("trustScore", 0) >= 80 else COLORS["amber"]
-            body(holder, rep_text, size=11, color=rep_color).pack(anchor="w", padx=14, pady=(4, 0))
+        self._render_truck_condition(holder, offer.get("carrierTruck"))
+        self._render_reputation(holder, offer.get("carrierReputation") or {})
 
-            for signal in (reputation.get("signals") or [])[:3]:
-                mark = {"positive": "+", "negative": "!", "neutral": "-"}.get(
-                    signal.get("kind"), "-"
-                )
-                body(holder, f"  {mark} {signal.get('label')}", size=10).pack(
-                    anchor="w", padx=14
-                )
-
-        for reason in (offer.get("scoreReasons") or [])[:3]:
-            body(holder, f"  • {reason}", size=10).pack(anchor="w", padx=14)
+        if not compact:
+            for reason in (offer.get("scoreReasons") or [])[:3]:
+                body(holder, f"  • {reason}", size=10).pack(anchor="w", padx=14)
 
         buttons = ctk.CTkFrame(holder, fg_color="transparent")
         buttons.pack(fill="x", padx=14, pady=(10, 12))
 
         if offer.get("state") in {"PENDING", "CARRIER_ACCEPTED"}:
-            label = (
-                "Confirm rescue" if offer.get("carrierAccepted") else "Pre-confirm"
-            )
+            label = "Confirm rescue" if offer.get("carrierAccepted") else "Pre-confirm"
             primary_button(
                 buttons, label, lambda o=offer: self._confirm_offer(o), height=34
             ).pack(side="left", padx=(0, 8))
             secondary_button(
-                buttons, "Withdraw", lambda o=offer: self._withdraw_offer(o), width=96
-            ).pack(side="left")
+                buttons, "Withdraw", lambda o=offer: self._withdraw_offer(o), width=92
+            ).pack(side="left", padx=(0, 8))
         elif offer.get("state") == "BOUND":
             body(
                 buttons,
-                f"Bound. Escrow {offer.get('escrowId')} holding "
-                f"{money(offer.get('priceTotalInr'))}.",
+                f"Bound · escrow holding {money(offer.get('priceTotalInr'))}",
                 size=11,
                 color=COLORS["teal"],
             ).pack(side="left")
             secondary_button(
-                buttons, "Escrow", lambda o=offer: self._show_escrow(o), width=90
+                buttons, "Escrow", lambda o=offer: self._show_escrow(o), width=88
             ).pack(side="right")
+
+        if offer.get("priceBreakdown"):
+            secondary_button(
+                buttons,
+                "Price breakdown",
+                lambda o=offer: self._show_price_breakdown(o),
+                width=130,
+            ).pack(side="left")
+
+    def _render_truck_condition(
+        self, master: Any, truck: Optional[Dict[str, Any]]
+    ) -> None:
+        """What is actually turning up.
+
+        "A reefer is on its way" is not the same as "a reefer that holds
+        -25C and has 24 m3 free is on its way", and for temperature-sensitive
+        cargo the difference decides whether the load survives.
+        """
+        if not truck:
+            return
+        bits = [str(truck.get("registrationNumber") or "Truck")]
+        if truck.get("refrigerated"):
+            floor = truck.get("minTempC")
+            bits.append(f"reefer to {floor:.0f}C" if floor is not None else "reefer")
+        else:
+            bits.append("ambient")
+        if truck.get("maxVolumeM3"):
+            bits.append(f"{truck['maxVolumeM3']:.0f} m3")
+        if truck.get("maxWeightKg"):
+            bits.append(f"{truck['maxWeightKg'] / 1000:.1f} t")
+        body(
+            master,
+            "  ".join(("· " + b) if i else b for i, b in enumerate(bits)),
+            size=10,
+        ).pack(anchor="w", padx=14, pady=(3, 0))
+
+    def _render_reputation(self, master: Any, reputation: Dict[str, Any]) -> None:
+        """Who the owner is about to trust, shown at the moment of the choice."""
+        if not reputation:
+            return
+        if reputation.get("isNewCounterparty"):
+            body(
+                master,
+                "New to the network — no completed rescues yet",
+                size=11,
+                color=COLORS["amber"],
+            ).pack(anchor="w", padx=14, pady=(4, 0))
+            return
+
+        stars = reputation.get("averageStars")
+        trust = reputation.get("trustScore") or 0
+        text = f"Trust {trust:.0f}  |  {reputation.get('rescuesCompleted', 0)} rescues"
+        if stars:
+            text += f"  |  {stars:.1f}/5 from {reputation.get('ratingCount', 0)} ratings"
+        if reputation.get("onTimePct") is not None:
+            text += f"  |  {reputation['onTimePct']:.0f}% on time"
+        body(
+            master,
+            text,
+            size=11,
+            color=COLORS["teal"] if trust >= 80 else COLORS["amber"],
+        ).pack(anchor="w", padx=14, pady=(4, 0))
+
+        for signal in (reputation.get("signals") or [])[:3]:
+            mark = {"positive": "+", "negative": "!", "neutral": "-"}.get(
+                signal.get("kind"), "-"
+            )
+            body(master, f"  {mark} {signal.get('label')}", size=10).pack(
+                anchor="w", padx=14
+            )
 
     # ---- offers tab ----
     def _build_offers(self) -> None:
@@ -1094,30 +1443,48 @@ class DashboardView(ctk.CTkFrame):
         wrap.grid_columnconfigure(1, weight=1, uniform="o")
         wrap.grid_rowconfigure(0, weight=1)
 
+        # Left: work other carriers want from us.
         inbox = card(wrap)
         inbox.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        inbox.grid_rowconfigure(1, weight=1)
+        inbox.grid_rowconfigure(2, weight=1)
         inbox.grid_columnconfigure(0, weight=1)
-        heading(inbox, "Offers to us").grid(row=0, column=0, sticky="w", padx=18, pady=(16, 2))
+        heading(inbox, "Requests to us").grid(
+            row=0, column=0, sticky="w", padx=18, pady=(16, 0)
+        )
         body(
             inbox,
             "Rescues other carriers have asked us to perform. Accepting shows "
-            "what we would earn; the customer's own price is theirs.",
+            "what we would earn; what the customer pays is theirs.",
             size=11,
-        ).grid(row=0, column=0, sticky="w", padx=18, pady=(34, 0))
+        ).grid(row=1, column=0, sticky="w", padx=18, pady=(2, 0))
 
         self.offers_inbox_listing = scrollable(inbox)
-        self.offers_inbox_listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(12, 14))
-
-        history = card(wrap)
-        history.grid(row=0, column=1, sticky="nsew")
-        history.grid_rowconfigure(1, weight=1)
-        history.grid_columnconfigure(0, weight=1)
-        heading(history, "Recent activity").grid(
-            row=0, column=0, sticky="w", padx=18, pady=(16, 8)
+        self.offers_inbox_listing.grid(
+            row=2, column=0, sticky="nsew", padx=14, pady=(12, 14)
         )
-        self.offers_history_listing = scrollable(history)
-        self.offers_history_listing.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+
+        # Right: work we have asked of other carriers. Previously this half
+        # showed the closed half of the same inbox, so a cargo owner running
+        # a rescue saw two empty panels on the screen where the negotiation
+        # was supposed to be happening.
+        outgoing = card(wrap)
+        outgoing.grid(row=0, column=1, sticky="nsew")
+        outgoing.grid_rowconfigure(2, weight=1)
+        outgoing.grid_columnconfigure(0, weight=1)
+        heading(outgoing, "Our rescue requests").grid(
+            row=0, column=0, sticky="w", padx=18, pady=(16, 0)
+        )
+        body(
+            outgoing,
+            "Offers we have sent out on our own breakdowns, and where each "
+            "carrier has got to.",
+            size=11,
+        ).grid(row=1, column=0, sticky="w", padx=18, pady=(2, 0))
+
+        self.offers_outgoing_listing = scrollable(outgoing)
+        self.offers_outgoing_listing.grid(
+            row=2, column=0, sticky="nsew", padx=14, pady=(12, 14)
+        )
 
         self.tab_frames["Rescue offers"] = wrap
 
@@ -1126,51 +1493,112 @@ class DashboardView(ctk.CTkFrame):
             child.destroy()
 
         live = [o for o in self.inbox if o.get("state") in {"PENDING", "OWNER_CONFIRMED"}]
-        if not live:
+        decided = [
+            o for o in self.inbox if o.get("state") not in {"PENDING", "OWNER_CONFIRMED"}
+        ]
+
+        if not live and not decided:
             EmptyState(
                 self.offers_inbox_listing,
                 "No open requests",
                 "When a nearby carrier's truck breaks down and one of ours fits "
                 "the cargo, the request appears here.",
             ).pack(fill="x")
+
         for offer in live:
-            holder = card(self.offers_inbox_listing, fg_color=COLORS["row"])
-            holder.pack(fill="x", pady=5)
-            row = ctk.CTkFrame(holder, fg_color="transparent")
-            row.pack(fill="x", padx=14, pady=(12, 2))
-            heading(row, f"Earn {money(offer.get('payoutInr'))}", size=15).pack(side="left")
-            fg, bg = state_color(offer.get("state", ""))
-            badge(row, state_label(offer.get("state", "")), fg, bg).pack(side="right")
-            body(
-                holder,
-                f"ETA {minutes_label(offer.get('etaMinutes'))}  |  "
-                f"{offer.get('distanceKm', 0):.1f} km away",
-                size=11,
-            ).pack(anchor="w", padx=14, pady=(2, 0))
+            self._render_inbox_card(self.offers_inbox_listing, offer)
 
-            buttons = ctk.CTkFrame(holder, fg_color="transparent")
-            buttons.pack(fill="x", padx=14, pady=(10, 12))
-            primary_button(
-                buttons, "Accept", lambda o=offer: self._accept_offer(o), height=34
-            ).pack(side="left", padx=(0, 8))
-            secondary_button(
-                buttons, "Decline", lambda o=offer: self._decline_offer(o), width=90
-            ).pack(side="left")
+        if decided:
+            eyebrow(self.offers_inbox_listing, "Already decided").pack(
+                anchor="w", padx=4, pady=(14, 6)
+            )
+            for offer in decided[:15]:
+                ListRow(
+                    self.offers_inbox_listing,
+                    f"Earn {money(offer.get('payoutInr'))}",
+                    f"{relative_time(offer.get('createdAt'))}"
+                    + (
+                        f"  |  {offer.get('distanceKm'):.1f} km"
+                        if offer.get("distanceKm") is not None
+                        else ""
+                    ),
+                    state_label(offer.get("state", "")),
+                    state_color(offer.get("state", "")),
+                ).pack(fill="x", pady=4, padx=2)
 
-        for child in self.offers_history_listing.winfo_children():
+        # -- the other direction ------------------------------------------
+        for child in self.offers_outgoing_listing.winfo_children():
             child.destroy()
 
-        closed = [o for o in self.inbox if o.get("state") not in {"PENDING", "OWNER_CONFIRMED"}]
-        if not closed:
-            EmptyState(self.offers_history_listing, "Nothing yet").pack(fill="x")
-        for offer in closed[:25]:
-            ListRow(
-                self.offers_history_listing,
-                money(offer.get("payoutInr")),
-                f"{offer.get('id')}  |  {relative_time(offer.get('createdAt'))}",
-                state_label(offer.get("state", "")),
-                state_color(offer.get("state", "")),
-            ).pack(fill="x", pady=4, padx=2)
+        any_rendered = False
+        for incident in self.incidents:
+            offers = self.outgoing_offers.get(incident.get("id")) or []
+            if not offers:
+                continue
+            any_rendered = True
+
+            header = ctk.CTkFrame(self.offers_outgoing_listing, fg_color="transparent")
+            header.pack(fill="x", pady=(10, 4), padx=2)
+            heading(
+                header, _short_label(incident.get("cargoType", "Cargo"), 30), size=13
+            ).pack(side="left")
+            fg, bg = state_color(incident.get("state", ""))
+            badge(header, state_label(incident.get("state", "")), fg, bg).pack(
+                side="right"
+            )
+
+            best = min(
+                (o for o in offers if o.get("priceTotalInr") is not None),
+                key=lambda o: o["priceTotalInr"],
+                default=None,
+            )
+            for offer in offers:
+                self._render_offer_card(
+                    self.offers_outgoing_listing,
+                    offer,
+                    is_best=best is not None and offer.get("id") == best.get("id"),
+                    compact=True,
+                )
+
+        if not any_rendered:
+            EmptyState(
+                self.offers_outgoing_listing,
+                "Nothing out for offer",
+                "Send offers from the command centre and every carrier's "
+                "response shows up here.",
+            ).pack(fill="x")
+
+    def _render_inbox_card(self, master: Any, offer: Dict[str, Any]) -> None:
+        """One rescue another carrier is asking us to perform.
+
+        Shows our payout and the physical job, and nothing about what the
+        cargo is worth to its owner -- that asymmetry is the product, not an
+        oversight, so it is enforced by the server and simply honoured here.
+        """
+        holder = card(master, fg_color=COLORS["row"])
+        holder.pack(fill="x", pady=5)
+
+        row = ctk.CTkFrame(holder, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=(12, 2))
+        heading(row, f"Earn {money(offer.get('payoutInr'))}", size=15).pack(side="left")
+        fg, bg = state_color(offer.get("state", ""))
+        badge(row, state_label(offer.get("state", "")), fg, bg).pack(side="right")
+
+        detail = f"ETA {minutes_label(offer.get('etaMinutes'))}"
+        if offer.get("distanceKm") is not None:
+            detail += f"  |  {offer['distanceKm']:.1f} km away"
+        if offer.get("expiresAt"):
+            detail += f"  |  expires {relative_time(offer['expiresAt'])}"
+        body(holder, detail, size=11).pack(anchor="w", padx=14, pady=(2, 0))
+
+        buttons = ctk.CTkFrame(holder, fg_color="transparent")
+        buttons.pack(fill="x", padx=14, pady=(10, 12))
+        primary_button(
+            buttons, "Accept", lambda o=offer: self._accept_offer(o), height=34
+        ).pack(side="left", padx=(0, 8))
+        secondary_button(
+            buttons, "Decline", lambda o=offer: self._decline_offer(o), width=90
+        ).pack(side="left")
 
     # ---- fleet ----
     def _build_fleet(self) -> None:
@@ -1559,30 +1987,74 @@ class DashboardView(ctk.CTkFrame):
             self._render_incident_detail()
 
     def _safe_after(self, callback: Callable[[], Any]) -> None:
-        """Marshal back to the Tk thread, unless the view has gone.
+        """Hand a callback from a worker thread back to the UI thread.
 
-        A refresh started before the operator signed out will still complete
-        on its worker thread; scheduling onto a destroyed widget raises.
+        Tk is single-threaded and `after()` is not safe to call from anywhere
+        else. It usually appears to work, which is worse than failing: the
+        call is accepted and then silently never runs. That is what made
+        clicking an incident sometimes load its offers and sometimes leave
+        the panel reading "no offers yet" next to an incident that had two.
+
+        So worker threads only ever touch a queue, which is thread-safe, and
+        the UI thread drains it on its own timer. Nothing outside the UI
+        thread calls into Tk at all.
         """
+        self._callbacks.put(callback)
+
+    def _drain_callbacks(self) -> None:
+        """Run whatever the workers have handed back. UI thread only."""
+        while True:
+            try:
+                callback = self._callbacks.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except Exception as exc:
+                # One failed update must not stop the pump, or the console
+                # freezes silently from then on.
+                logging.getLogger(__name__).warning(
+                    "deferred UI update failed: %s", exc
+                )
         try:
             if self.winfo_exists():
-                self.after(0, callback)
+                self.after(CALLBACK_DRAIN_MS, self._drain_callbacks)
         except Exception:
             pass
 
-    def _run(self, work: Callable[[], Any], success: str) -> None:
-        """Run an API call off the UI thread and report what happened."""
+    def _run(
+        self,
+        work: Callable[[], Any],
+        success: str,
+        on_error: Optional[Callable[[ApiError], bool]] = None,
+    ) -> None:
+        """Run an API call off the UI thread and report what happened.
+
+        Everything comes back through _safe_after rather than self.after:
+        Tk is single-threaded, and scheduling from a worker sometimes takes
+        and sometimes silently does not, which is how a button press could
+        appear to do nothing at all.
+
+        `on_error` may handle a failure itself; returning True suppresses the
+        generic error box, for the cases where a refusal is a normal step in
+        the workflow rather than a fault.
+        """
 
         def task():
             try:
                 work()
-                self.after(0, lambda: self.master_app.set_status(success))
-                self.after(0, self.refresh)
+                self._safe_after(lambda: self.master_app.set_status(success))
+                self._safe_after(self.refresh)
                 current_id = self.selected_incident_id
                 if current_id:
-                    self.after(0, lambda: self.select_incident(current_id))
+                    self._safe_after(lambda: self.select_incident(current_id))
             except ApiError as exc:
-                self.after(0, lambda: messagebox.showerror("CargoResQ", str(exc)))
+                def report(e=exc):
+                    if on_error is not None and on_error(e):
+                        return
+                    messagebox.showerror("CargoResQ", str(e))
+
+                self._safe_after(report)
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -1593,9 +2065,29 @@ class DashboardView(ctk.CTkFrame):
         )
 
     def _send_offers(self, incident: Dict[str, Any]) -> None:
+        def no_candidates(exc: ApiError) -> bool:
+            """"Nobody can take it" is a fork in the road, not a dead end.
+
+            The matcher refuses to force an incompatible truck onto sensitive
+            cargo, which is correct -- but the operator is then one click from
+            two real options, and an error box that only says no is unhelpful
+            at exactly the moment help is needed.
+            """
+            if "no compatible truck" not in str(exc).lower():
+                return False
+            if messagebox.askyesno(
+                "No single truck fits",
+                "No nearby truck can take this whole load.\n\n"
+                "Would you like to see how it could be divided across "
+                "several trucks?",
+            ):
+                self._open_split(incident)
+            return True
+
         self._run(
             lambda: self.master_app.client.fan_out_offers(incident["id"]),
             "Offers sent to nearby compatible carriers.",
+            on_error=no_candidates,
         )
 
     def _confirm_offer(self, offer: Dict[str, Any]) -> None:
@@ -1665,11 +2157,210 @@ class DashboardView(ctk.CTkFrame):
                 events = self.master_app.client.incident_timeline(incident_id)
                 sla = self.master_app.client.incident_sla(incident_id)
             except ApiError as exc:
-                self.after(0, lambda: messagebox.showerror("CargoResQ", str(exc)))
+                self._safe_after(lambda: messagebox.showerror("CargoResQ", str(exc)))
                 return
-            self.after(0, lambda: self.master_app.open_timeline(incident_id, events, sla))
+            self._safe_after(lambda: self.master_app.open_timeline(incident_id, events, sla))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _render_active_rescues(self, master: Any) -> None:
+        """Our side of a rescue we agreed to perform.
+
+        The owner of the cargo watches a rescue through their incident. The
+        carrier performing it had only a line in an offer inbox -- no idea
+        where the stranded truck was or how far their own driver still had to
+        go. A two-party job needs two live views of it, not one.
+        """
+        if not self.active_rescues:
+            return
+
+        eyebrow(master, "Rescues we are performing").pack(anchor="w", pady=(10, 6))
+
+        for rescue in self.active_rescues:
+            holder = card(master, fg_color=COLORS["teal_soft"])
+            holder.pack(fill="x", pady=5)
+
+            row = ctk.CTkFrame(holder, fg_color="transparent")
+            row.pack(fill="x", padx=14, pady=(12, 2))
+            heading(
+                row,
+                _short_label(rescue.get("cargo", {}).get("type") or "Cargo", 30),
+                size=14,
+            ).pack(side="left")
+            fg, bg = state_color(rescue.get("incidentState", ""))
+            badge(row, state_label(rescue.get("incidentState", "")), fg, bg).pack(
+                side="right"
+            )
+
+            body(
+                holder,
+                f"For {rescue.get('customerCompany')}  \u00b7  "
+                f"we earn {money(rescue.get('payoutInr'))}",
+                size=11,
+            ).pack(anchor="w", padx=14)
+
+            ours = rescue.get("ourTruck") or {}
+            theirs = rescue.get("strandedTruck") or {}
+            distance = rescue.get("distanceKm")
+            line = f"{ours.get('registrationNumber', 'Our truck')} \u2192 "
+            line += str(theirs.get("registrationNumber", "stranded truck"))
+            if distance is not None:
+                line += f"  \u00b7  {distance:.1f} km apart"
+            if rescue.get("minutesUntilSpoilage") is not None:
+                line += f"  \u00b7  {minutes_label(rescue['minutesUntilSpoilage'])} of cargo time"
+            body(holder, line, size=10).pack(anchor="w", padx=14, pady=(2, 0))
+
+            if not ours.get("positionIsLive"):
+                body(
+                    holder,
+                    "Our truck is not reporting its position",
+                    size=10,
+                    color=COLORS["amber"],
+                ).pack(anchor="w", padx=14)
+
+            buttons = ctk.CTkFrame(holder, fg_color="transparent")
+            buttons.pack(fill="x", padx=14, pady=(8, 12))
+            secondary_button(
+                buttons,
+                "Show on map",
+                lambda r=rescue: self._focus_rescue(r),
+                width=110,
+            ).pack(side="left")
+
+    def _focus_rescue(self, rescue: Dict[str, Any]) -> None:
+        panel = getattr(self, "map_panel", None)
+        lat = rescue.get("breakdownLat")
+        lng = rescue.get("breakdownLng")
+        if panel is not None and lat is not None and lng is not None:
+            panel.focus_on(float(lat), float(lng), zoom=12)
+
+    def _render_rescuer_strip(self, master: Any, incident: Dict[str, Any]) -> None:
+        """Where the help is, for the person waiting for it.
+
+        The distance is the headline because it is the only question the
+        operator on the phone to a stranded driver is being asked.
+        """
+        rescuer = incident.get("rescuer")
+        if not rescuer:
+            return
+
+        strip = card(master, fg_color=COLORS["teal_soft"])
+        strip.pack(fill="x", pady=(4, 10))
+
+        row = ctk.CTkFrame(strip, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=(10, 2))
+
+        distance = rescuer.get("distanceKm")
+        if rescuer.get("arrived"):
+            headline = "Rescuer has arrived"
+        elif distance is None:
+            headline = "Rescuer position unknown"
+        elif distance < 1:
+            headline = f"Rescuer {distance * 1000:.0f} m away"
+        else:
+            headline = f"Rescuer {distance:.1f} km away"
+        heading(row, headline, size=14).pack(side="left")
+        badge(
+            row,
+            "Live" if rescuer.get("positionIsLive") else "Last known",
+            COLORS["teal"] if rescuer.get("positionIsLive") else COLORS["muted"],
+            COLORS["card"],
+        ).pack(side="right")
+
+        detail = f"{rescuer.get('companyName')}  ·  {rescuer.get('registrationNumber')}"
+        if rescuer.get("etaMinutes") is not None and not rescuer.get("arrived"):
+            detail += f"  ·  about {minutes_label(rescuer['etaMinutes'])} out"
+        if rescuer.get("speedKph"):
+            detail += f"  ·  {rescuer['speedKph']:.0f} km/h"
+        body(strip, detail, size=11).pack(anchor="w", padx=14)
+
+        if not rescuer.get("positionIsLive"):
+            body(
+                strip,
+                "Their truck is not reporting live -- this is where it was "
+                "last seen.",
+                size=10,
+                color=COLORS["amber"],
+            ).pack(anchor="w", padx=14, pady=(2, 10))
+        else:
+            body(strip, "", size=2).pack()
+
+    def _render_relay_strip(self, master: Any, incident: Dict[str, Any]) -> None:
+        """Say plainly that this load is no longer going where it was."""
+        facility = next(
+            (
+                f
+                for f in self.facilities
+                if f.get("id") == incident.get("relayFacilityId")
+            ),
+            None,
+        )
+        strip = card(master, fg_color=COLORS["amber_soft"])
+        strip.pack(fill="x", pady=(4, 10))
+
+        row = ctk.CTkFrame(strip, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=(10, 2))
+        heading(
+            row,
+            f"Diverted to {facility['name'] if facility else 'safe storage'}",
+            size=14,
+        ).pack(side="left")
+        badge(row, "Relay", COLORS["amber"], COLORS["card"]).pack(side="right")
+
+        detail = incident.get("relayReason") or "Journey cannot be completed in time"
+        if facility:
+            detail += f"  ·  {facility.get('address') or ''}"
+        body(strip, detail, size=11).pack(anchor="w", padx=14, pady=(0, 10))
+
+    def _open_relay(self, incident: Dict[str, Any]) -> None:
+        def work():
+            data = self.master_app.client.relay_options(incident["id"])
+            self._safe_after(
+                lambda: self.master_app.open_relay_dialog(
+                    incident, data, self._commit_relay
+                )
+            )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _commit_relay(self, incident: Dict[str, Any], option: Dict[str, Any]) -> None:
+        self._run(
+            lambda: self.master_app.client.relay_to_storage(
+                incident["id"],
+                option["facilityId"],
+                reason=f"Relayed to {option['name']} -- journey cannot be completed",
+            ),
+            f"Cargo diverted to {option['name']}.",
+        )
+
+    def _open_split(self, incident: Dict[str, Any]) -> None:
+        def work():
+            data = self.master_app.client.split_plan(incident["id"])
+            self._safe_after(
+                lambda: self.master_app.open_split_dialog(incident, data)
+            )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _stand_down(self, incident: Dict[str, Any]) -> None:
+        if not messagebox.askyesno(
+            "Stand down",
+            (
+                "Take back this breakdown?\n\n"
+                "Offers to carriers are withdrawn, any escrow hold is "
+                "reversed, and the shipment goes back to in transit."
+            ),
+        ):
+            return
+        self._run(
+            lambda: self.master_app.client.stand_down_incident(
+                incident["id"], "Stood down from the operations console"
+            ),
+            "Breakdown stood down. The shipment is back in transit.",
+        )
+
+    def _show_price_breakdown(self, offer: Dict[str, Any]) -> None:
+        self.master_app.open_price_breakdown(offer)
 
     def _show_escrow(self, offer: Dict[str, Any]) -> None:
         escrow_id = offer.get("escrowId")
@@ -1681,9 +2372,9 @@ class DashboardView(ctk.CTkFrame):
                 ledger = self.master_app.client.escrow_ledger(escrow_id)
                 escrow = self.master_app.client.escrow(escrow_id)
             except ApiError as exc:
-                self.after(0, lambda: messagebox.showerror("CargoResQ", str(exc)))
+                self._safe_after(lambda: messagebox.showerror("CargoResQ", str(exc)))
                 return
-            self.after(0, lambda: self.master_app.open_escrow(escrow, ledger))
+            self._safe_after(lambda: self.master_app.open_escrow(escrow, ledger))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1692,9 +2383,9 @@ class DashboardView(ctk.CTkFrame):
             try:
                 data = self.master_app.client.cold_chain(shipment["id"])
             except ApiError as exc:
-                self.after(0, lambda: messagebox.showerror("CargoResQ", str(exc)))
+                self._safe_after(lambda: messagebox.showerror("CargoResQ", str(exc)))
                 return
-            self.after(0, lambda: self.master_app.open_cold_chain(shipment, data))
+            self._safe_after(lambda: self.master_app.open_cold_chain(shipment, data))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1953,6 +2644,310 @@ class CargoResQApp(ctk.CTk):
                 f"{entry.get('account')}  {side} {money(amount)}",
                 f"{entry.get('postingType')}  |  {entry.get('memo') or ''}",
             ).pack(fill="x", pady=3, padx=2)
+
+    def open_price_breakdown(self, offer: Dict[str, Any]) -> None:
+        """The arithmetic behind a quote, including what held it down.
+
+        A rescue price is a multiple of ordinary freight, which invites the
+        obvious suspicion that a stranded owner is being charged whatever the
+        moment will bear. The answer is to show the whole sum -- every
+        multiplier, and the ceiling that actually bound it -- rather than a
+        total and a promise that it is fair.
+        """
+        b = offer.get("priceBreakdown") or {}
+        window = self._dialog("Price breakdown", height=640)
+
+        heading(window, money(offer.get("priceTotalInr")), size=22).pack(
+            anchor="w", padx=24, pady=(22, 0)
+        )
+        body(
+            window,
+            f"{offer.get('carrierCompanyName') or 'Carrier'}  ·  "
+            f"{offer.get('distanceKm', 0):.1f} km  ·  "
+            f"formula {b.get('formula_version', 'n/a')}",
+            size=11,
+        ).pack(anchor="w", padx=24, pady=(2, 14))
+
+        KeyValueGrid(
+            window,
+            [
+                ("Distance rate", money(b.get("base_rate_inr"))),
+                ("Callout fee", money(b.get("callout_fee_inr"))),
+                ("Transfer labour", money(b.get("transfer_fee_inr"))),
+                ("Subtotal", money(b.get("subtotal_inr"))),
+            ],
+        ).pack(fill="x", padx=24, pady=(0, 10))
+
+        eyebrow(window, "Multipliers").pack(anchor="w", padx=24, pady=(4, 6))
+        KeyValueGrid(
+            window,
+            [
+                ("Urgency", _multiplier_text(b.get("urgency_multiplier"))),
+                ("Scarcity", _multiplier_text(b.get("scarcity_multiplier"))),
+                ("Cargo condition", _multiplier_text(b.get("condition_multiplier"))),
+                ("Carrier reputation", _multiplier_text(b.get("reputation_multiplier"))),
+            ],
+        ).pack(fill="x", padx=24, pady=(0, 10))
+
+        cap = b.get("cap_applied")
+        cap_text = {
+            "multiple_of_normal_freight": "Capped at 3x ordinary freight for this leg",
+            "share_of_cargo_value": "Capped at 25% of the cargo's declared value",
+        }.get(cap, "No ceiling needed" if not cap else str(cap))
+
+        eyebrow(window, "Limits that applied").pack(anchor="w", padx=24, pady=(4, 6))
+        KeyValueGrid(
+            window,
+            [
+                ("Before limits", money(b.get("uncapped_total_inr"))),
+                ("Ordinary freight", money(b.get("normal_freight_inr"))),
+                ("Ceiling", cap_text),
+                (
+                    "Carrier floor",
+                    "Raised to the carrier's minimum margin"
+                    if b.get("floor_applied")
+                    else "Not needed",
+                ),
+            ],
+        ).pack(fill="x", padx=24, pady=(0, 10))
+
+        eyebrow(window, "Who gets what").pack(anchor="w", padx=24, pady=(4, 6))
+        KeyValueGrid(
+            window,
+            [
+                ("Owner pays", money(b.get("total_inr") or offer.get("priceTotalInr"))),
+                ("Carrier receives", money(offer.get("carrierPayoutInr"))),
+                ("Platform fee", money(offer.get("platformFeeInr"))),
+            ],
+        ).pack(fill="x", padx=24, pady=(0, 12))
+
+        factors = b.get("factors") or []
+        if factors:
+            eyebrow(window, "In words").pack(anchor="w", padx=24, pady=(0, 6))
+            listing = scrollable(window)
+            listing.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+            for factor in factors:
+                body(listing, f"• {factor}", size=11).pack(
+                    anchor="w", padx=8, pady=2
+                )
+
+    def open_relay_dialog(
+        self,
+        incident: Dict[str, Any],
+        data: Dict[str, Any],
+        on_choose: Callable[[Dict[str, Any], Dict[str, Any]], None],
+    ) -> None:
+        """Where this cargo could go instead of finishing its journey.
+
+        Every facility within range is listed, including the ones that will
+        not work. An operator with four options and no usable one needs to see
+        that, not an empty panel -- the absence of a fallback is itself the
+        thing they have to act on.
+        """
+        window = self._dialog("Relay to safe storage", width=680, height=680)
+
+        heading(window, "Relay to safe storage", size=20).pack(
+            anchor="w", padx=24, pady=(22, 2)
+        )
+        body(
+            window,
+            "When the journey cannot be completed in time, the cargo goes to "
+            "the nearest facility that can actually hold it. A load kept in "
+            "spec at a depot keeps its value; a load delivered late does not.",
+            size=11,
+        ).pack(anchor="w", padx=24, pady=(0, 10))
+
+        KeyValueGrid(
+            window,
+            [
+                ("Cargo", incident.get("cargoType", "--")),
+                ("Time left", minutes_label(data.get("minutesUntilSpoilage"))),
+                (
+                    "Usable options",
+                    "{0} of {1}".format(
+                        data.get("reachableCount", 0), data.get("optionCount", 0)
+                    ),
+                ),
+            ],
+        ).pack(fill="x", padx=24, pady=(0, 12))
+
+        listing = scrollable(window)
+        listing.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+
+        options = data.get("options") or []
+        if not options:
+            EmptyState(
+                listing,
+                "No storage in range",
+                "No facility is within reach of this breakdown. Widening the "
+                "search or finding a rescue truck are the remaining options.",
+            ).pack(fill="x")
+            return
+
+        for option in options:
+            self._render_relay_option(listing, incident, option, window, on_choose)
+
+    def _render_relay_option(
+        self,
+        master: Any,
+        incident: Dict[str, Any],
+        option: Dict[str, Any],
+        window: Any,
+        on_choose: Callable[[Dict[str, Any], Dict[str, Any]], None],
+    ) -> None:
+        usable = option.get("suitable") and option.get("arrivesInTime") is not False
+        holder = card(
+            master,
+            fg_color=COLORS["row"] if usable else COLORS["card"],
+            border_width=1,
+            border_color=COLORS["teal"] if usable else COLORS["line"],
+        )
+        holder.pack(fill="x", pady=5)
+
+        row = ctk.CTkFrame(holder, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=(12, 2))
+        heading(row, option.get("name", "Facility"), size=14).pack(side="left")
+
+        if not option.get("suitable"):
+            badge(row, "Cannot hold", COLORS["red"], COLORS["red_soft"]).pack(side="right")
+        elif option.get("arrivesInTime") is False:
+            badge(row, "Too far", COLORS["amber"], COLORS["amber_soft"]).pack(side="right")
+        else:
+            badge(row, "Reachable", COLORS["teal"], COLORS["teal_soft"]).pack(side="right")
+
+        spare = option.get("minutesToSpare")
+        line = "{0:.1f} km  \u00b7  {1} away".format(
+            option.get("distanceKm", 0), minutes_label(option.get("etaMinutes"))
+        )
+        if spare is not None:
+            line += (
+                "  \u00b7  {0:.0f} min to spare".format(spare)
+                if spare >= 0
+                else "  \u00b7  {0:.0f} min too late".format(abs(spare))
+            )
+        body(holder, line, size=11).pack(anchor="w", padx=14)
+
+        body(
+            holder,
+            "{0}  \u00b7  {1:.0f} m3 free  \u00b7  handling {2}".format(
+                option.get("operator"),
+                option.get("availableM3", 0),
+                money(option.get("estimatedCostInr")),
+            ),
+            size=10,
+        ).pack(anchor="w", padx=14, pady=(2, 0))
+
+        for blocker in option.get("blockers") or []:
+            body(
+                holder, "  \u00d7 " + str(blocker), size=10, color=COLORS["red"]
+            ).pack(anchor="w", padx=14)
+        for reason in (option.get("reasons") or [])[:2]:
+            body(holder, "  \u2713 " + str(reason), size=10).pack(anchor="w", padx=14)
+
+        buttons = ctk.CTkFrame(holder, fg_color="transparent")
+        buttons.pack(fill="x", padx=14, pady=(8, 12))
+        if option.get("suitable") and option.get("arrivesInTime") is not False:
+            primary_button(
+                buttons,
+                "Divert cargo here",
+                lambda o=option: (window.destroy(), on_choose(incident, o)),
+                height=32,
+            ).pack(side="left")
+        elif option.get("suitable"):
+            # The site can hold the cargo but our estimate says it arrives
+            # after the clock runs out. Offered anyway, and labelled as the
+            # gamble it is: the ETA is an estimate and a dispatcher with
+            # local knowledge may be right where the arithmetic is not.
+            secondary_button(
+                buttons,
+                "Divert anyway (arrives late)",
+                lambda o=option: (window.destroy(), on_choose(incident, o)),
+                width=196,
+            ).pack(side="left")
+        else:
+            body(
+                buttons, "Not an option for this cargo", size=10, color=COLORS["muted"]
+            ).pack(side="left")
+
+    def open_split_dialog(self, incident: Dict[str, Any], data: Dict[str, Any]) -> None:
+        """How a load would divide when no one truck can take it."""
+        window = self._dialog("Split the load", width=660, height=600)
+
+        heading(window, "Split the load", size=20).pack(anchor="w", padx=24, pady=(22, 2))
+        body(
+            window,
+            "A consignment no single truck can carry is not an unrescuable "
+            "consignment. Every truck in a split still has to suit the cargo "
+            "on its own -- only capacity is pooled.",
+            size=11,
+        ).pack(anchor="w", padx=24, pady=(0, 10))
+
+        single = (
+            "{0} available".format(data.get("singleTruckCount", 0))
+            if data.get("singleTruckAvailable")
+            else "none can take it whole"
+        )
+        KeyValueGrid(
+            window,
+            [
+                ("Cargo", data.get("cargoType", "--")),
+                ("Volume", "{0:.1f} m3".format(data.get("volumeM3", 0))),
+                ("Weight", "{0:.1f} t".format((data.get("weightKg") or 0) / 1000)),
+                ("Single truck", single),
+            ],
+        ).pack(fill="x", padx=24, pady=(0, 10))
+
+        body(window, data.get("message", ""), size=11, color=COLORS["ink"]).pack(
+            anchor="w", padx=24, pady=(0, 12)
+        )
+
+        listing = scrollable(window)
+        listing.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+
+        plan = data.get("plan")
+        if not plan:
+            shortfall = data.get("shortfall") or {}
+            EmptyState(
+                listing,
+                "Cannot be covered",
+                "{0} compatible trucks nearby offer {1:.0f} m3 against "
+                "{2:.0f} m3 needed.".format(
+                    shortfall.get("trucksConsidered", 0),
+                    shortfall.get("availableVolumeM3", 0),
+                    shortfall.get("requiredVolumeM3", 0),
+                ),
+            ).pack(fill="x")
+            return
+
+        for index, leg in enumerate(plan.get("legs", []), start=1):
+            holder = card(listing, fg_color=COLORS["row"])
+            holder.pack(fill="x", pady=5)
+
+            row = ctk.CTkFrame(holder, fg_color="transparent")
+            row.pack(fill="x", padx=14, pady=(12, 2))
+            heading(
+                row, "Leg {0}: {1}".format(index, leg.get("registrationNumber")), size=14
+            ).pack(side="left")
+            badge(
+                row,
+                "{0:.0f}% of load".format(leg.get("sharePct", 0)),
+                COLORS["teal"],
+                COLORS["teal_soft"],
+            ).pack(side="right")
+
+            body(
+                holder,
+                "{0} m3  \u00b7  {1:.1f} t  \u00b7  {2:.1f} km away  \u00b7  {3}".format(
+                    leg.get("volumeM3"),
+                    (leg.get("weightKg") or 0) / 1000,
+                    leg.get("distanceKm", 0),
+                    "reefer" if leg.get("refrigerated") else "ambient",
+                ),
+                size=11,
+            ).pack(anchor="w", padx=14, pady=(0, 12))
+
+        for note in plan.get("notes", []):
+            body(listing, "\u2022 " + str(note), size=10).pack(anchor="w", padx=8, pady=2)
 
     def open_cold_chain(self, shipment: Dict, data: Dict) -> None:
         window = self._dialog("Cold chain", height=580)

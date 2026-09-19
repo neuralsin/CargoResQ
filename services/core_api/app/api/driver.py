@@ -3,20 +3,29 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
+from jose import JWTError
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..auth import (
     create_access_token,
+    create_refresh_token,
+    decode_refresh_token,
     get_current_company_principal,
     get_current_driver,
     hash_password,
     verify_password,
 )
 from ..database import get_db
+from ..events.producer import event_producer
 from ..models import Company, Driver, Shipment, Truck
+from services.orchestrator.app.counterpart import counterpart_for_driver
 from services.orchestrator.app.models import Incident
+from services.orchestrator.app.stand_down import (
+    CannotStandDown,
+    stand_down_incident,
+)
 from .breakdowns import BreakdownIn, ingest_breakdown
 
 router = APIRouter(prefix="/api/v1/driver", tags=["driver"])
@@ -40,11 +49,24 @@ class DriverRegisterRequest(BaseModel):
 
 class DriverTokenResponse(BaseModel):
     access_token: str
+    #: Exchanged for a new access token when the short one expires, so a
+    #: driver is not signed out part-way through a shift.
+    refresh_token: str
     token_type: str = "bearer"
     driver_id: str
     company_id: str
     driver_name: str
     role: str = "DRIVER"
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str = Field(..., min_length=16)
+
+
+class StandDownRequest(BaseModel):
+    """Taking back a breakdown that turned out not to be one."""
+
+    reason: Optional[str] = Field(None, max_length=280)
 
 
 class DriverBreakdownRequest(BaseModel):
@@ -65,6 +87,13 @@ async def _driver_from_claims(claims: dict, db: AsyncSession) -> Driver:
 def _token_response(driver: Driver) -> DriverTokenResponse:
     return DriverTokenResponse(
         access_token=create_access_token(
+            subject=driver.email,
+            company_id=driver.company_id,
+            role="DRIVER",
+            principal_type="driver",
+            principal_id=driver.id,
+        ),
+        refresh_token=create_refresh_token(
             subject=driver.email,
             company_id=driver.company_id,
             role="DRIVER",
@@ -121,6 +150,37 @@ async def login_driver(
             detail="Incorrect driver email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    return _token_response(driver)
+
+@router.post("/refresh", response_model=DriverTokenResponse)
+async def refresh_driver_token(
+    req: RefreshRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Exchange a refresh token for a new pair.
+
+    The account is re-read rather than trusted from the token, so a driver
+    who has been deactivated since the refresh token was issued cannot renew
+    their way back in. The refresh token is rotated on every use: a stolen
+    one stops working as soon as the real device renews.
+    """
+    invalid = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Session expired. Please sign in again.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = decode_refresh_token(req.refresh_token)
+    except JWTError:
+        raise invalid
+
+    if payload.get("principal_type") != "driver":
+        raise invalid
+
+    driver = await db.get(Driver, str(payload.get("principal_id") or ""))
+    if driver is None or not driver.active:
+        raise invalid
+
     return _token_response(driver)
 
 
@@ -255,3 +315,57 @@ def _shipment_payload(shipment: Optional[Shipment]) -> Optional[dict]:
         "weightKg": shipment.weight_kg,
         "valueInr": shipment.value_inr,
     }
+
+@router.post("/stand-down")
+async def driver_stand_down(
+    req: StandDownRequest,
+    claims: dict = Depends(get_current_driver),
+    db: AsyncSession = Depends(get_db),
+):
+    """Undo my own breakdown report.
+
+    Scoped to the driver's own truck and company by the same query that finds
+    their active incident, so a driver can only take back a call they were in
+    a position to make in the first place.
+    """
+    driver = await _driver_from_claims(claims, db)
+    result = await db.execute(
+        select(Incident)
+        .join(Shipment, Shipment.id == Incident.shipment_id)
+        .where(Shipment.owner_company_id == driver.company_id)
+        .where(Shipment.truck_id == driver.assigned_truck_id)
+        .where(Incident.state.not_in(["ESCROW_RELEASED", "DISPUTED", "CANCELLED"]))
+        .order_by(Incident.created_at.desc())
+    )
+    incident = result.scalars().first()
+    if incident is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="You have no open breakdown to stand down",
+        )
+
+    try:
+        return await stand_down_incident(
+            db,
+            incident,
+            actor_id=driver.id,
+            reason=req.reason or "Driver reported back on the road",
+            event_publisher=event_producer.publish,
+        )
+    except CannotStandDown as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+@router.get("/counterpart")
+async def get_counterpart(
+    claims: dict = Depends(get_current_driver),
+    db: AsyncSession = Depends(get_db),
+):
+    """The other truck in my rescue: where it is and how far off.
+
+    Polled by the driver app while a rescue is live. Returns null when there
+    is no bound rescue, which is most of the time -- the app then shows
+    nothing rather than a stale pin from the last job.
+    """
+    driver = await _driver_from_claims(claims, db)
+    link = await counterpart_for_driver(db, driver)
+    return {"link": link}

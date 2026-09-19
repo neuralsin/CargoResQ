@@ -1,5 +1,6 @@
 package com.cargoresq.driver.api
 
+import com.cargoresq.driver.Session
 import com.cargoresq.driver.model.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -78,16 +79,28 @@ object CargoResQApi {
     private suspend fun execute(requestSupplier: () -> Request): Result<String> = withContext(Dispatchers.IO) {
         try {
             val request = requestSupplier()
-            client.newCall(request).execute().use { response ->
-                val body = response.body?.string().orEmpty()
-                if (response.isSuccessful) {
-                    Result.success(body)
-                } else {
-                    Result.failure(
-                        ApiException(describeError(response.code, body), response.code)
-                    )
-                }
+            val first = run(request)
+            if (first.code != 401 || !request.carriesBearerToken() || request.isAuthEndpoint()) {
+                return@withContext first.toResult()
             }
+
+            // The access token has expired mid-shift. Renew it once, quietly,
+            // and replay the request. A driver should never see a session
+            // boundary -- they see a sudden wall of "unauthorised" errors
+            // while parked beside a load that is warming up.
+            val renewed = renewSession()
+            if (!renewed) {
+                return@withContext Result.failure(
+                    ApiException(
+                        "Your session has expired. Please sign in again.",
+                        401,
+                    )
+                )
+            }
+            val token = Session.token
+                ?: return@withContext first.toResult()
+            run(request.newBuilder().header("Authorization", "Bearer " + token).build())
+                .toResult()
         } catch (e: IOException) {
             Result.failure(
                 ApiException(
@@ -100,6 +113,55 @@ object CargoResQApi {
             Result.failure(ApiException(e.message ?: "Invalid server URL"))
         } catch (e: Exception) {
             Result.failure(ApiException(e.message ?: "Unexpected error"))
+        }
+    }
+
+
+    /** One HTTP round trip, captured as a status and a body. */
+    private data class RawResponse(val code: Int, val body: String) {
+        val isSuccessful: Boolean get() = code in 200..299
+    }
+
+    private fun run(request: Request): RawResponse =
+        client.newCall(request).execute().use { response ->
+            RawResponse(response.code, response.body?.string().orEmpty())
+        }
+
+    private fun RawResponse.toResult(): Result<String> =
+        if (isSuccessful) Result.success(body)
+        else Result.failure(ApiException(describeError(code, body), code))
+
+    private fun Request.carriesBearerToken(): Boolean =
+        header("Authorization")?.startsWith("Bearer ") == true
+
+    /** Login and refresh must never trigger a refresh of their own. */
+    private fun Request.isAuthEndpoint(): Boolean {
+        val path = url.encodedPath
+        return path.endsWith("/driver/login") || path.endsWith("/driver/refresh")
+    }
+
+    /**
+     * Trade the refresh token for a fresh pair.
+     *
+     * Returns false when there is nothing to refresh with or the server
+     * refuses, which is the genuine end of the session -- the caller then
+     * reports it once rather than retrying forever.
+     */
+    private fun renewSession(): Boolean {
+        val refresh = Session.refreshToken
+        if (refresh.isNullOrBlank()) return false
+        return try {
+            val payload = JSONObject().put("refresh_token", refresh)
+            val response = run(post("/api/v1/driver/refresh", null, payload))
+            if (!response.isSuccessful) return false
+            val json = JSONObject(response.body)
+            Session.updateTokens(
+                json.getString("access_token"),
+                json.optString("refresh_token", refresh),
+            )
+            true
+        } catch (e: Exception) {
+            false
         }
     }
 
@@ -151,6 +213,7 @@ object CargoResQApi {
                 val json = JSONObject(body)
                 DriverSession(
                     token = json.getString("access_token"),
+                    refreshToken = json.optString("refresh_token", ""),
                     driverId = json.getString("driver_id"),
                     driverName = json.getString("driver_name"),
                     companyId = json.getString("company_id"),
@@ -234,6 +297,65 @@ object CargoResQApi {
         return execute(post("/api/v1/driver/report-breakdown", token, payload))
             .mapCatching { JSONObject(it).optString("status", "breakdown_registered") }
     }
+
+    /**
+     * Take back a breakdown that turned out not to be one.
+     *
+     * A driver presses the breakdown button from the roadside, often before
+     * they know what is wrong. Sometimes it restarts. Without this the only
+     * way out was to rebuild the server's data, which is not something that
+     * can happen on a hard shoulder at 2am.
+     */
+    suspend fun standDown(token: String, reason: String?): Result<StandDownResult> {
+        val payload = JSONObject().apply {
+            reason?.let { put("reason", it) }
+        }
+        return execute(post("/api/v1/driver/stand-down", token, payload))
+            .mapCatching { body ->
+                val json = JSONObject(body)
+                StandDownResult(
+                    incidentId = json.optString("incidentId"),
+                    state = json.optString("state"),
+                    offersWithdrawn = json.optInt("offersWithdrawn"),
+                    escrowsReversed = json.optInt("escrowsReversed"),
+                )
+            }
+    }
+
+
+    /**
+     * Where the other truck in my rescue is.
+     *
+     * Returns null inside a success when there is no bound rescue, which is
+     * the normal state. That is deliberately not a failure: the app should
+     * show nothing rather than an error for the ordinary case of not
+     * currently being in a rescue.
+     */
+    suspend fun counterpart(token: String): Result<CounterpartLink?> =
+        execute(get("/api/v1/driver/counterpart", token)).mapCatching { body ->
+            val link = JSONObject(body).optJSONObject("link") ?: return@mapCatching null
+            val other = link.getJSONObject("counterpart")
+            CounterpartLink(
+                myRole = link.optString("role", "STRANDED"),
+                incidentId = link.optString("incidentId"),
+                incidentState = link.optString("incidentState"),
+                companyName = other.optString("companyName", "Carrier"),
+                driverName = other.optStringOrNull("driverName"),
+                driverPhone = other.optStringOrNull("driverPhone"),
+                registrationNumber = other.optStringOrNull("registrationNumber"),
+                refrigerated = other.optBoolean("refrigerated", false),
+                latitude = other.optDoubleOrNull("latitude"),
+                longitude = other.optDoubleOrNull("longitude"),
+                speedKph = other.optDoubleOrNull("speedKph"),
+                positionIsLive = other.optBoolean("positionIsLive", false),
+                lastSeenAt = other.optStringOrNull("lastSeenAt"),
+                distanceKm = link.optDoubleOrNull("distanceKm"),
+                etaMinutes = link.optDoubleOrNull("etaMinutes"),
+                arrived = link.optBoolean("arrived", false),
+                cargoType = link.optJSONObject("cargo")?.optStringOrNull("type"),
+                minutesUntilSpoilage = link.optDoubleOrNull("minutesUntilSpoilage"),
+            )
+        }
 
     // -- offers -----------------------------------------------------------
 
